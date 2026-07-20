@@ -135,4 +135,16 @@ APP_MIGRATIONS = [
             " used_at TEXT)",
         ],
     },
+    {
+        # 里程碑 10:平台元状态表(套件切换检测,H04 §8.2.8 / F.5)。
+        # key-value 形态,当前仅 crypto_suite 一键;expand 型追加不触碰既有表。
+        "version": 9,
+        "name": "platform_meta_table",
+        "common": [
+            "CREATE TABLE IF NOT EXISTS platform_meta ("
+            " key TEXT PRIMARY KEY,"
+            " value TEXT NOT NULL,"
+            " updated_at TEXT NOT NULL)",
+        ],
+    },
 ]

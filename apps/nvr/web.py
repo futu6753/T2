@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 
 from gd_common.errors import PolicyValidationError
 from gd_storage.audit import AuditWriter
+from gd_storage.suite_state import record_suite_startup
 from apps.nvr.alerts import AlertEngine
 from apps.nvr.checker import DeviceChecker
 from apps.nvr.debounce import ALL_MODES, DebouncePolicy, MODE_CONSECUTIVE
@@ -46,6 +47,7 @@ class NvrContext:
         self.sso = sso
         self.cookie_name = sso.config.cookie_name or COOKIE_NAME
         self.audit = AuditWriter(db, suite)
+        record_suite_startup(db, self.audit, suite)
         self.accounts = RpAccountService(db, suite, table="nvr_users",
                                          allowed_roles=NVR_ROLES,
                                          default_role="auditor")

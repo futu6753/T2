@@ -17,6 +17,7 @@ from gd_crypto import (decrypt_envelope, encrypt_envelope,
                        envelope_from_json, envelope_to_json)
 from gd_policy.service import SettingsService
 from gd_storage.audit import AuditWriter
+from gd_storage.suite_state import record_suite_startup
 
 from apps.factory3d import layout as lo
 from apps.factory3d import stream
@@ -39,6 +40,7 @@ class F3dContext:
         self.ring = ring
         self.settings = settings or SettingsService(db, environ=environ)
         self.audit = AuditWriter(db, suite)
+        record_suite_startup(db, self.audit, suite)
         self.layouts = lo.LayoutService(db)
         doc, self.data_rev = self.layouts.get()
         self.simulator = Simulator(doc)

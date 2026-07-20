@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse
 from gd_common.errors import PolicyValidationError
 from gd_common.jsonlog import get_logger
 from gd_storage.audit import AuditWriter
+from gd_storage.suite_state import record_suite_startup
 from apps.certvault.auth_local import LocalAuthService
 from apps.certvault.records import RecordService
 from apps.certvault.store import CertStore
@@ -101,6 +102,7 @@ class CvContext:
         self.cookie_name = sso.config.cookie_name or COOKIE_NAME
         self.jwt = CvJwt(ring)
         self.audit = AuditWriter(db, suite)
+        record_suite_startup(db, self.audit, suite)
         self.accounts = RpAccountService(db, suite, table="cv_users",
                                          allowed_roles=(ROLE_ADMIN, ROLE_USER),
                                          default_role=ROLE_USER,

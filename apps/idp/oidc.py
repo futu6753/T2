@@ -134,7 +134,8 @@ class OidcService:
         if user is None:
             return None, ERROR_INVALID_GRANT
         id_token = mint_id_token(self.issuer, client_id, user, groups,
-                                 payload["amr"], payload["nonce"], self._keys)
+                                 payload["amr"], payload["nonce"], self._keys,
+                                 suite=self._suite)
         access_token = secrets.token_urlsafe(32)
         self._store.set(make_key("idp", "access", access_token),
                         json.dumps({"account": user["account"], "groups": groups,
@@ -164,7 +165,8 @@ class OidcService:
             " WHERE enabled = 1 AND backchannel_url IS NOT NULL")
         notified = []
         for client_id, url in rows:
-            token = mint_logout_token(self.issuer, client_id, account, self._keys)
+            token = mint_logout_token(self.issuer, client_id, account, self._keys,
+                                      suite=self._suite)
             deliver(url, token)
             notified.append(client_id)
         return notified

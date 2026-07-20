@@ -12,6 +12,7 @@ import os
 from gd_crypto import current_suite, MasterKeyRing
 from gd_policy import resolve_profile, SettingsService
 from gd_storage import apply_migrations, AuditWriter, Database, LocalVolatileStore
+from gd_storage.suite_state import record_suite_startup
 from apps.idp.accounts import AccountService
 from apps.idp.keys import ServerKeyStore
 from apps.idp.oidc import OidcService
@@ -35,6 +36,7 @@ class IdpContext:
         self.ring = MasterKeyRing.from_env(self.environ)
         self.suite = current_suite(self.environ)
         self.audit = AuditWriter(self.db, self.suite)
+        record_suite_startup(self.db, self.audit, self.suite)
         self.keys = ServerKeyStore(key_dir)
         self.issuer = issuer or self.environ.get("IDP_ISSUER", DEFAULT_ISSUER)
         self.profile = resolve_profile(self.settings, environ=self.environ)

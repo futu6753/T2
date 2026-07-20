@@ -62,9 +62,10 @@ def sample_cert_jpeg(seed: int = 5, size: tuple = (320, 480)) -> bytes:
 class CvEnv:
     """certvault 端到端环境(本地登录体系为主,SSO 可选)。"""
 
-    def __init__(self, allow_open_register: bool = True, registry=None):
+    def __init__(self, allow_open_register: bool = True, registry=None,
+                 extra_environ: dict = None):
         """@brief 装配 IdP(供 SSO 场景)与 certvault 应用"""
-        self.idp = IdpEnv(is_demo=False)
+        self.idp = IdpEnv(is_demo=False, extra_environ=extra_environ)
         self.idp.seed_admin_and_user()
         self.sso, self.rp_store, _ = make_sso_client(
             self.idp, "certvault", "certvault", CV_REDIRECT)

@@ -26,12 +26,13 @@ TEST_IP = "10.0.0.1"
 class IdpEnv:
     """一套可重启的 IdP 测试环境(db/keys/store 跨"重启"保持)。"""
 
-    def __init__(self, is_demo: bool = False):
-        """@brief 首次构建环境"""
+    def __init__(self, is_demo: bool = False, extra_environ: dict = None):
+        """@brief 首次构建环境 @param extra_environ 追加环境(如 CRYPTO_SUITE=gm)"""
         self.db_path = tempfile.mktemp(suffix=".db")
         self.key_dir = tempfile.mkdtemp(prefix="idp-keys-")
         self.store = LocalVolatileStore()
         self.is_demo = is_demo
+        self.extra_environ = dict(extra_environ or {})
         self.ctx = None
         self.restart()
 
@@ -40,6 +41,7 @@ class IdpEnv:
         environ = {"MASTER_KEY_HEX": TEST_KEY_HEX, "MASTER_KEY_ID": "mk1"}
         if self.is_demo:
             environ["DEMO_MODE"] = "1"
+        environ.update(self.extra_environ)
         return environ
 
     def restart(self):
