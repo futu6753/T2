@@ -112,9 +112,16 @@ class MigrationState:
 def _reseal(raw_json: str, ring: MasterKeyRing, target: ICryptoSuite,
             aad: bytes) -> str:
     """@brief 单对象解旧包新;已达目标套件返回 None(幂等跳过)。
-    显式 environ={} 关闭双写——迁移产物统一为目标套件单段。"""
+    显式 environ={} 关闭双写——迁移产物统一为目标套件单段。
+    target=None 为主密钥轮换语义:算法不变,仅当前主密钥重包(H06-E10)。"""
     envelope = envelope_from_json(raw_json)
-    if envelope.get("alg") == target.aead_alg and "dual" not in envelope:
+    if target is None:
+        wrapped_kid = (envelope.get("wrapped_dek") or {}).get("kid")
+        if wrapped_kid == ring.current_kid:
+            return None
+        from gd_crypto.suites import suite_for_aead_alg
+        target = suite_for_aead_alg(envelope.get("alg", ""))
+    elif envelope.get("alg") == target.aead_alg and "dual" not in envelope:
         return None
     plaintext = decrypt_envelope(envelope, ring, aad=aad)
     return envelope_to_json(encrypt_envelope(plaintext, ring, target,
@@ -149,12 +156,16 @@ def _migrate_db_target(db, ring, target, spec, state, audit) -> None:
                 db.execute(f"UPDATE {spec['table']} SET {col} = ?"  # noqa: S608
                            f" WHERE {spec['id_col']} = ?", (new_json, row_id))
                 if reindex and col == reindex["source"]:
-                    plain = decrypt_envelope(envelope_from_json(new_json), ring,
+                    parsed = envelope_from_json(new_json)
+                    from gd_crypto.suites import suite_for_aead_alg
+                    index_suite = (target if target is not None
+                                   else suite_for_aead_alg(parsed["alg"]))
+                    plain = decrypt_envelope(parsed, ring,
                                              aad=spec["aad"]).decode("utf-8")
                     db.execute(
                         f"UPDATE {spec['table']} SET {reindex['index_col']} = ?"  # noqa: S608
                         f" WHERE {spec['id_col']} = ?",
-                        (hmac_index(plain, ring.current_key, target), row_id))
+                        (hmac_index(plain, ring.current_key, index_suite), row_id))
                 migrated += 1
         state.advance(key, rows[-1][0], migrated, skipped)
         audit.append(MIGRATE_ACTOR, "crypto_migration_progress",
@@ -214,6 +225,26 @@ def _password_report(db, target) -> dict:
                       and target.password_needs_rehash(stored))
         report[table] = {"total": len(rows), "pending_rehash": pending}
     return report
+
+
+def run_key_rotation(db, ring: MasterKeyRing, audit, blob_dir: str = None,
+                     state_file: str = None) -> dict:
+    """
+    @brief  主密钥轮换(H06-E10 轮换=迁移):环境须同时注入新钥(MASTER_KEY_HEX)
+            与旧钥(OLD_MASTER_KEY_HEX);逐对象按原算法解包并用当前主密钥重包,
+            幂等、可断点。完成写 master_key_rotated 审计锚点。
+    @return 汇总报告 dict
+    """
+    state = MigrationState(state_file, f"rotate:{ring.current_kid}")
+    for spec in DB_ENVELOPE_TARGETS:
+        _migrate_db_target(db, ring, None, spec, state, audit)
+    for spec in FILE_ENVELOPE_TARGETS:
+        _migrate_file_target(db, ring, None, spec, blob_dir, state, audit)
+    total = sum(c["migrated"] for c in state.data["counts"].values())
+    audit.append(MIGRATE_ACTOR, "master_key_rotated",
+                 {"to_kid": ring.current_kid, "rewrapped": total}, LOCAL_IP)
+    return {"to_kid": ring.current_kid, "rewrapped": total,
+            "phases": state.data["counts"]}
 
 
 def run_migration(db, ring: MasterKeyRing, target: ICryptoSuite, audit,

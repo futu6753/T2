@@ -256,6 +256,41 @@ class TestRIdp2Migrate(unittest.TestCase):
         env.close()
 
 
+class TestMasterKeyRotation(unittest.TestCase):
+    """H06-E10 轮换=迁移:旧 kid 对象全部重包为新钥,算法不变,幂等。"""
+
+    def test_e10_rotate_master_key_rewrap_idempotent(self):
+        """双钥环轮换:重包计数/新 kid/明文不变/重跑零重包/审计锚点"""
+        from gd_crypto.migrate import run_key_rotation
+        env = IdpEnv()
+        env.seed_admin_and_user()
+        env.ctx.accounts.create_user("rot_u", "轮换用户", USER_PASSWORD,
+                                     env.ctx.profile, "system", TEST_IP,
+                                     phone=PHONE_SAMPLE, force_change=False)
+        old_ring = env.ctx.ring
+        new_key_hex = secrets.token_hex(32)
+        rotated_ring = MasterKeyRing.from_env({
+            "MASTER_KEY_HEX": new_key_hex, "MASTER_KEY_ID": "mk2",
+            "OLD_MASTER_KEY_HEX": TEST_KEY_HEX, "OLD_MASTER_KEY_ID": "mk1"})
+        report = run_key_rotation(env.ctx.db, rotated_ring, env.ctx.audit)
+        self.assertGreaterEqual(report["rewrapped"], 1)
+        row = env.ctx.db.query("SELECT phone_ct FROM idp_users WHERE account = ?",
+                               ("rot_u",))[0]
+        parsed = envelope_from_json(row[0])
+        self.assertEqual(parsed["wrapped_dek"]["kid"], "mk2")
+        self.assertEqual(parsed["alg"], "AES-256-GCM")  # 算法不变
+        self.assertEqual(decrypt_envelope(parsed, rotated_ring).decode(),
+                         PHONE_SAMPLE)
+        rerun = run_key_rotation(env.ctx.db, rotated_ring, env.ctx.audit)
+        self.assertEqual(rerun["rewrapped"], 0)
+        self.assertIn("master_key_rotated", _audit_actions(env.ctx.db))
+        self.assertGreater(verify_chain(env.ctx.db), 0)
+        # 旧环(无新钥)对已轮换对象给出 E10 明确指引
+        with self.assertRaises(Exception):
+            decrypt_envelope(parsed, old_ring)
+        env.close()
+
+
 class TestF4DemoOrthogonal(unittest.TestCase):
     """F.4:DEMO=1 下套件行为与生产一致(算法不降级)。"""
 

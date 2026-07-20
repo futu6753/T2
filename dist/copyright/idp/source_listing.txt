@@ -1,0 +1,3112 @@
+【内部资料】本文件由三包流水线自动生成,仅限申报准备使用。
+港电 UniPass 统一身份认证与单点登录平台 V2.0 源码打印稿(自动抽取,剔空行)
+著作权人:厦门自贸片区港务电力有限公司(港电实验室)
+生成日期:2026-07-20
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 1/62 页 ——
+===== apps/idp/__init__.py =====
+===== apps/idp/accounts.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    accounts.py
+@brief   IdP 账户服务(H03/H04/H05):建号与口令策略、口令登录+锁定(Redis 计数,
+         两步验证失败同计次)、TOTP、短信验证码(D2/D3 简化仅经 SecurityProfile)、
+         演示账号种子/停用、管理员解锁。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import datetime
+import re
+import secrets
+from gd_common.errors import PolicyValidationError
+from gd_crypto import (
+    encrypt_envelope, envelope_from_json, envelope_to_json, decrypt_envelope,
+    hash_password, hmac_index,
+)
+from gd_crypto.password import verify_password
+from gd_policy.profile import is_test_code_accepted, SecurityProfile
+from gd_storage import events, make_key
+from apps.idp import totp as totp_mod
+STATUS_ACTIVE = "active"
+STATUS_DISABLED = "disabled"
+STATUS_DEMO = "demo"
+LOGIN_OK = "ok"
+LOGIN_FAILED = "failed"          # 统一"用户名或口令错误"(H04 §五 鉴别信息)
+LOGIN_LOCKED = "locked"
+LOGIN_NEED_TOTP = "need_totp"
+LOGIN_MUST_CHANGE = "must_change_password"
+SMS_CODE_TTL_SECONDS = 300       # 短信验证码 5 分钟有效(02-A2)
+SMS_CODE_DIGITS = 6
+DEMO_SEED_ACCOUNTS = (           # H05-D1:演示种子账号(状态=demo)
+    ("admin@example.com", "演示管理员", True),
+    ("demo@example.com", "演示用户", False),
+)
+DEMO_SEED_PASSWORD = "Demo@2026#Test"    # 满足三类字符;生产态账号被停用
+_COMPLEXITY_CLASSES = (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^a-zA-Z0-9]")
+def _now_iso() -> str:
+    """@brief 当前 UTC 时间 ISO 串"""
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+def validate_password_policy(password: str, profile: SecurityProfile):
+    """@brief 口令策略校验(注册/改密/建号统一入口,H03 §2)"""
+    if len(password) < profile.password_min_length:
+        raise PolicyValidationError(
+            f"口令长度不得小于 {profile.password_min_length} 位")
+    matched = sum(1 for pattern in _COMPLEXITY_CLASSES if re.search(pattern, password))
+    required = 4 if profile.password_complexity == "four_classes" else 3
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 2/62 页 ——
+    if matched < required:
+        raise PolicyValidationError(f"口令须至少包含 {required} 类字符(大小写/数字/符号)")
+class AccountService:
+    """统一用户目录操作(ARC-1 唯一主源)。"""
+    def __init__(self, db, ring, suite, store, audit):
+        """@brief 注入存储/密钥环/套件/易失态/审计"""
+        self._db, self._ring, self._suite = db, ring, suite
+        self._store, self._audit = store, audit
+    # ---- 建号与查询 -------------------------------------------------------
+    def create_user(self, account: str, display_name: str, password: str,
+                    profile: SecurityProfile, actor: str, ip: str,
+                    is_admin: bool = False, status: str = STATUS_ACTIVE,
+                    phone: str = None, force_change: bool = True) -> int:
+        """@brief 管理员建号(默认首登强改密,H03 §2 first_login_force_change)"""
+        validate_password_policy(password, profile)
+        phone_ct, phone_idx = None, None
+        if phone:
+            phone_ct = envelope_to_json(encrypt_envelope(
+                phone.encode(), self._ring, self._suite))
+            phone_idx = hmac_index(phone, self._ring.current_key, self._suite)
+        self._db.execute(
+            "INSERT INTO idp_users(account, display_name, password_hash, phone_ct,"
+            " phone_index, status, is_admin, must_change_password,"
+            " password_changed_at, created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (account, display_name, hash_password(password, self._suite), phone_ct,
+             phone_idx, status, 1 if is_admin else 0,
+             1 if (force_change and profile.first_login_force_change) else 0,
+             _now_iso(), _now_iso()))
+        self._audit.append(actor, events.USER_CREATED, {"account": account}, ip)
+        return self.get_user(account)["id"]
+    def get_user(self, account: str) -> dict:
+        """@brief 按账号取用户(不存在返回 None)"""
+        rows = self._db.query(
+            "SELECT id, account, display_name, password_hash, totp_secret_ct,"
+            " status, is_admin, must_change_password, password_changed_at"
+            " FROM idp_users WHERE account = ?", (account,))
+        if not rows:
+            return None
+        keys = ("id", "account", "display_name", "password_hash", "totp_secret_ct",
+                "status", "is_admin", "must_change_password", "password_changed_at")
+        return dict(zip(keys, rows[0]))
+    def user_groups(self, user_id: int) -> list:
+        """@brief 用户所属组名列表(进 id_token groups 声明)"""
+        rows = self._db.query(
+            "SELECT g.name FROM idp_groups g JOIN idp_group_members m"
+            " ON m.group_id = g.id WHERE m.user_id = ?", (user_id,))
+        return [row[0] for row in rows]
+    # ---- 锁定计数(Redis 跨实例,TTL 到期即自动解锁) ----------------------
+    def _lock_key(self, account: str) -> str:
+        """@brief 锁定标记键"""
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 3/62 页 ——
+        return make_key("idp", "lock", account)
+    def is_locked(self, account: str) -> bool:
+        """@brief 是否处于锁定期"""
+        return self._store.get(self._lock_key(account)) is not None
+    def record_failure(self, account: str, profile: SecurityProfile, ip: str):
+        """@brief 记一次鉴别失败(口令或两步验证同计次,H04 §一.b)"""
+        fail_key = make_key("idp", "fail", account)
+        count = self._store.incr(fail_key, ttl_seconds=profile.lockout_minutes * 60)
+        if count >= profile.max_login_failures:
+            self._store.set(self._lock_key(account), "1",
+                            ttl_seconds=profile.lockout_minutes * 60)
+            self._audit.append(account, events.LOGIN_LOCKED,
+                               {"failures": count,
+                                "lockout_minutes": profile.lockout_minutes}, ip)
+    def clear_failures(self, account: str):
+        """@brief 登录成功清零计数"""
+        self._store.delete(make_key("idp", "fail", account))
+    def admin_unlock(self, account: str, actor: str, ip: str):
+        """@brief 管理员立即解锁(只解锁不改密,留审计,06-E5)"""
+        self._store.delete(self._lock_key(account))
+        self._store.delete(make_key("idp", "fail", account))
+        self._audit.append(actor, events.USER_UNLOCKED, {"account": account}, ip)
+    # ---- 口令登录(第一步) ------------------------------------------------
+    def password_login_step(self, account: str, password: str,
+                            profile: SecurityProfile, ip: str) -> tuple:
+        """
+        @brief  口令校验步:返回 (结果码, 用户);登录错误统一措辞防枚举
+        @return (LOGIN_*, user|None)
+        """
+        if not profile.method_password:
+            return LOGIN_FAILED, None
+        if self.is_locked(account):
+            return LOGIN_LOCKED, None
+        user = self.get_user(account)
+        acceptable = {STATUS_ACTIVE, STATUS_DEMO} if profile.is_demo else {STATUS_ACTIVE}
+        if user is None or user["status"] not in acceptable or not user["password_hash"]:
+            if user is not None:
+                self.record_failure(account, profile, ip)
+            self._audit.append(account, events.LOGIN_FAILED, {"step": "password"}, ip)
+            return LOGIN_FAILED, None
+        is_ok, new_hash = verify_password(password, user["password_hash"], self._suite)
+        if not is_ok:
+            self.record_failure(account, profile, ip)
+            self._audit.append(account, events.LOGIN_FAILED, {"step": "password"}, ip)
+            return LOGIN_FAILED, None
+        if new_hash:            # 透明重哈希为当前套件算法(H04 §8.2.5)
+            self._db.execute("UPDATE idp_users SET password_hash = ? WHERE id = ?",
+                             (new_hash, user["id"]))
+        if user["totp_secret_ct"]:
+            return LOGIN_NEED_TOTP, user
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 4/62 页 ——
+        if user["must_change_password"]:
+            return LOGIN_MUST_CHANGE, user
+        return LOGIN_OK, user
+    def finish_login(self, user: dict, ip: str, method: str):
+        """@brief 登录成功收尾:清计数、刷时间戳、审计"""
+        self.clear_failures(user["account"])
+        self._db.execute("UPDATE idp_users SET last_login_at = ? WHERE id = ?",
+                         (_now_iso(), user["id"]))
+        self._audit.append(user["account"], events.LOGIN_SUCCESS,
+                           {"method": method}, ip)
+    # ---- TOTP ------------------------------------------------------------
+    def bind_totp(self, account: str, actor: str, ip: str) -> str:
+        """@brief 生成并绑定 TOTP 密钥(信封加密落库),返回 base32 供二维码"""
+        secret = totp_mod.generate_totp_secret()
+        secret_ct = envelope_to_json(encrypt_envelope(
+            secret.encode(), self._ring, self._suite))
+        self._db.execute("UPDATE idp_users SET totp_secret_ct = ? WHERE account = ?",
+                         (secret_ct, account))
+        self._audit.append(actor, events.TWOFA_ENABLED, {"account": account}, ip)
+        return secret
+    def verify_totp_step(self, user: dict, code: str, profile: SecurityProfile,
+                         ip: str) -> bool:
+        """@brief 两步验证:D2 测试码仅经 profile 判定;失败与口令同计次"""
+        if is_test_code_accepted(profile, code):
+            return True
+        if not user["totp_secret_ct"]:
+            return False
+        secret = decrypt_envelope(envelope_from_json(user["totp_secret_ct"]),
+                                  self._ring).decode("ascii")
+        if totp_mod.verify_totp(secret, code):
+            return True
+        self.record_failure(user["account"], profile, ip)
+        self._audit.append(user["account"], events.LOGIN_FAILED, {"step": "totp"}, ip)
+        return False
+    # ---- 短信验证码(D3 回显仅经 profile) ---------------------------------
+    def send_sms_code(self, account: str, profile: SecurityProfile) -> str:
+        """@brief 生成验证码入 Redis(散列存储);DEMO 回显原码,生产返回 None"""
+        code = "".join(secrets.choice("0123456789") for _ in range(SMS_CODE_DIGITS))
+        digest = hmac_index(code, self._ring.current_key, self._suite)
+        self._store.set(make_key("idp", "sms", account), digest,
+                        ttl_seconds=SMS_CODE_TTL_SECONDS)
+        return code if profile.sms_echo_enabled else None
+    def verify_sms_code(self, account: str, code: str, profile: SecurityProfile,
+                        ip: str) -> bool:
+        """@brief 校验短信验证码(一次性,D2 测试码仅经 profile)"""
+        if is_test_code_accepted(profile, code):
+            return True
+        record = self._store.get(make_key("idp", "sms", account))
+        from gd_crypto import hmac_index_matches
+        if record and hmac_index_matches(code, record, self._ring.current_key):
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 5/62 页 ——
+            self._store.delete(make_key("idp", "sms", account))
+            return True
+        self.record_failure(account, profile, ip)
+        return False
+    # ---- 改密与演示账号 ----------------------------------------------------
+    def change_password(self, account: str, new_password: str,
+                        profile: SecurityProfile, actor: str, ip: str):
+        """@brief 改密(策略校验+清首登强改标记+审计)"""
+        validate_password_policy(new_password, profile)
+        self._db.execute(
+            "UPDATE idp_users SET password_hash = ?, must_change_password = 0,"
+            " password_changed_at = ? WHERE account = ?",
+            (hash_password(new_password, self._suite), _now_iso(), account))
+        self._audit.append(actor, events.PASSWORD_CHANGED, {"account": account}, ip)
+    def seed_demo_accounts(self, profile: SecurityProfile, ip: str):
+        """@brief D1:DEMO 启动播种演示账号(存在则重新启用)"""
+        for account, display_name, is_admin in DEMO_SEED_ACCOUNTS:
+            if self.get_user(account) is None:
+                self.create_user(account, display_name, DEMO_SEED_PASSWORD, profile,
+                                 "system", ip, is_admin=is_admin, status=STATUS_DEMO,
+                                 force_change=False)
+            else:
+                self._db.execute("UPDATE idp_users SET status = ? WHERE account = ?",
+                                 (STATUS_DEMO, account))
+    def disable_demo_accounts(self, ip: str) -> int:
+        """@brief 切生产:status=demo 账号自动停用(不删、留审计,H05 §3.2)"""
+        rows = self._db.query(
+            "SELECT account FROM idp_users WHERE status = ?", (STATUS_DEMO,))
+        for (account,) in rows:
+            self._db.execute("UPDATE idp_users SET status = ? WHERE account = ?",
+                             (STATUS_DISABLED, account))
+            self._audit.append("system", events.USER_DISABLED,
+                               {"account": account, "reason": "demo→prod"}, ip)
+        return len(rows)
+===== apps/idp/context.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    context.py
+@brief   IdP 应用上下文:装配共享库(db/settings/profile/密钥环/套件/易失态/审计/
+         签名钥/账户/会话/OIDC),模式热切换时整体重建生效快照(H05 §1.2)。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import os
+from gd_crypto import current_suite, MasterKeyRing
+from gd_policy import resolve_profile, SettingsService
+from gd_storage import apply_migrations, AuditWriter, Database, LocalVolatileStore
+from gd_storage.suite_state import record_suite_startup
+from apps.idp.accounts import AccountService
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 6/62 页 ——
+from apps.idp.keys import ServerKeyStore
+from apps.idp.oidc import OidcService
+from apps.idp.sessions import SessionService
+DEFAULT_ISSUER = "http://127.0.0.1:9000"
+class IdpContext:
+    """IdP 运行上下文(单实例装配一次;profile 为不可变快照,业务只读)。"""
+    def __init__(self, db_url: str, key_dir: str, store=None, environ=None,
+                 config_file: str = None, issuer: str = None):
+        """@brief 装配全部依赖;易失态可注入(生产 Redis / 测试本地)"""
+        self.environ = dict(os.environ if environ is None else environ)
+        self.db = Database(db_url)
+        apply_migrations(self.db)
+        self.store = store if store is not None else LocalVolatileStore()
+        self.settings = SettingsService(self.db, config_file=config_file,
+                                        environ=self.environ)
+        self.ring = MasterKeyRing.from_env(self.environ)
+        self.suite = current_suite(self.environ)
+        self.audit = AuditWriter(self.db, self.suite)
+        record_suite_startup(self.db, self.audit, self.suite)
+        self.keys = ServerKeyStore(key_dir)
+        self.issuer = issuer or self.environ.get("IDP_ISSUER", DEFAULT_ISSUER)
+        self.profile = resolve_profile(self.settings, environ=self.environ)
+        self._rebuild_services()
+    def _rebuild_services(self):
+        """@brief 按当前 profile 重建各服务(会话超时等参数随快照生效)"""
+        self.accounts = AccountService(self.db, self.ring, self.suite,
+                                       self.store, self.audit)
+        self.sessions = SessionService(self.store, self.profile)
+        self.oidc = OidcService(self.db, self.store, self.keys, self.suite,
+                                self.issuer)
+    def refresh_profile(self, environ_override: dict = None):
+        """@brief 重新解析生效策略快照(模式热切换入口,H05 §3)"""
+        if environ_override is not None:
+            self.environ = dict(environ_override)
+        self.profile = resolve_profile(self.settings, environ=self.environ)
+        self._settings_version = self.settings.version()
+        self._rebuild_services()
+        return self.profile
+    def maybe_refresh(self):
+        """
+        @brief  设置版本轮询:他实例改配置后本实例 ≤ 下一请求即生效
+                (09 §二 G.4 策略热更新全实例传播;版本号在共享库)
+        """
+        latest = self.settings.version()
+        if latest != getattr(self, "_settings_version", 0):
+            self.refresh_profile()
+    def user_lookup(self, account: str) -> tuple:
+        """@brief OIDC 换令牌时的用户回查(account → (user, groups))"""
+        user = self.accounts.get_user(account)
+        if user is None:
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 7/62 页 ——
+            return None, []
+        return user, self.accounts.user_groups(user["id"])
+    def close(self):
+        """@brief 释放数据库连接"""
+        self.db.close()
+===== apps/idp/forms.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    forms.py
+@brief   表单解析工具:离线环境无 python-multipart,自研 urlencoded 解析
+         (ARC-5 最小第三方依赖;管理台服务端表单均为 urlencoded)。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import urllib.parse
+from fastapi import Request
+MAX_FORM_BYTES = 64 * 1024      # 表单体积上限(H04 §四 数据有效性校验)
+async def read_form(request: Request) -> dict:
+    """
+    @brief  读取 application/x-www-form-urlencoded 表单(超限截断拒绝)
+    @param  request FastAPI 请求
+    @return {字段: 首值} 字典
+    """
+    raw = await request.body()
+    if len(raw) > MAX_FORM_BYTES:
+        return {}
+    parsed = urllib.parse.parse_qs(raw.decode("utf-8", errors="replace"),
+                                   keep_blank_values=True)
+    return {key: values[0] for key, values in parsed.items()}
+def form_bool(form: dict, key: str) -> bool:
+    """@brief 表单布尔字段(1/true/on 计真)"""
+    return str(form.get(key, "")).lower() in ("1", "true", "on", "yes")
+===== apps/idp/keys.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    keys.py
+@brief   IdP 服务器签名密钥仓(H08 server-keys / ARC-7):RSA-2048 私钥落共享存储、
+         kid 稳定(重启不变)、文件 0600;JWKS 发布;RS256 签名。
+         SM2 私钥同仓落盘(gm 套件 id_token 签名),JWKS 双钥发布(RSA+SM2,
+         kid 区分),RP 按 kid 验签——套件切换后旧令牌有效期内仍可验(H04 §8.2.3)。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import base64
+import hashlib
+import os
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 8/62 页 ——
+RSA_KEY_BITS = 2048
+RSA_PUBLIC_EXPONENT = 65537
+KEY_FILE_MODE = 0o600           # H04 §九:密钥文件权限
+KID_HEX_LEN = 16                # kid = 公钥摘要前 16 位 hex(稳定且不泄露密钥)
+PRIVATE_KEY_FILENAME = "idp_rsa_private.pem"
+SM2_KEY_FILENAME = "idp_sm2_private.hex"
+SM2_COORD_LEN = 32
+def _b64url_uint(value: int) -> str:
+    """@brief 大整数转 JWK base64url(RFC 7518)"""
+    raw = value.to_bytes((value.bit_length() + 7) // 8, "big")
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+class ServerKeyStore:
+    """签名密钥仓:多实例读同一目录,kid 由公钥内容派生(重启/多实例恒定)。"""
+    def __init__(self, key_dir: str):
+        """@brief 装载或首次生成签名私钥 @param key_dir 共享密钥目录"""
+        os.makedirs(key_dir, exist_ok=True)
+        self._key_path = os.path.join(key_dir, PRIVATE_KEY_FILENAME)
+        if os.path.exists(self._key_path):
+            with open(self._key_path, "rb") as handle:
+                self._private_key = serialization.load_pem_private_key(
+                    handle.read(), password=None)
+        else:
+            self._private_key = rsa.generate_private_key(
+                public_exponent=RSA_PUBLIC_EXPONENT, key_size=RSA_KEY_BITS)
+            pem = self._private_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption())
+            with open(self._key_path, "wb") as handle:
+                handle.write(pem)
+            os.chmod(self._key_path, KEY_FILE_MODE)
+        public_der = self._private_key.public_key().public_bytes(
+            serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        self.kid = hashlib.sha256(public_der).hexdigest()[:KID_HEX_LEN]
+        self._load_or_create_sm2(key_dir)
+    def _load_or_create_sm2(self, key_dir: str):
+        """@brief 装载或首次生成 SM2 签名私钥(gm 套件 id_token 用,GAP-01 解除)"""
+        from gd_crypto.gm import sm2 as _sm2
+        sm2_path = os.path.join(key_dir, SM2_KEY_FILENAME)
+        if os.path.exists(sm2_path):
+            with open(sm2_path, "r", encoding="ascii") as handle:
+                self._sm2_private = int(handle.read().strip(), 16)
+        else:
+            self._sm2_private, _ = _sm2.generate_keypair()
+            with open(sm2_path, "w", encoding="ascii") as handle:
+                handle.write(f"{self._sm2_private:064x}")
+            os.chmod(sm2_path, KEY_FILE_MODE)
+        self._sm2_public = _sm2.public_key_from_private(self._sm2_private)
+        pub_bytes = (self._sm2_public[0].to_bytes(SM2_COORD_LEN, "big")
+                     + self._sm2_public[1].to_bytes(SM2_COORD_LEN, "big"))
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 9/62 页 ——
+        self.sm2_kid = hashlib.sha256(b"sm2" + pub_bytes).hexdigest()[:KID_HEX_LEN]
+    def sign_rs256(self, message: bytes) -> bytes:
+        """@brief RS256 签名(OIDC id_token/logout_token,H04 §8.1)"""
+        return self._private_key.sign(message, padding.PKCS1v15(), hashes.SHA256())
+    def sign_sm2(self, message: bytes) -> bytes:
+        """@brief SM2-with-SM3 签名(gm 套件下 id_token/logout_token,H04 §8.1)"""
+        from gd_crypto.gm import sm2 as _sm2
+        return _sm2.sign(message, self._sm2_private)
+    def jwks(self) -> dict:
+        """@brief JWKS 文档:RSA 与 SM2 双钥同时发布(RP 按 kid 验签,
+        套件切换后旧令牌有效期内仍可验,H04 §8.2.3)"""
+        numbers = self._private_key.public_key().public_numbers()
+        def _b64url_coord(value: int) -> str:
+            raw = value.to_bytes(SM2_COORD_LEN, "big")
+            return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+        return {"keys": [
+            {"kty": "RSA", "use": "sig", "alg": "RS256", "kid": self.kid,
+             "n": _b64url_uint(numbers.n), "e": _b64url_uint(numbers.e)},
+            {"kty": "EC", "crv": "SM2", "use": "sig", "alg": "SM2SM3",
+             "kid": self.sm2_kid, "x": _b64url_coord(self._sm2_public[0]),
+             "y": _b64url_coord(self._sm2_public[1])},
+        ]}
+===== apps/idp/mode.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    mode.py
+@brief   运行模式切换服务(H05 §3):DEMO→生产自动恢复清单(顺序执行、幂等)、
+         生产→DEMO 二次确认+原因入审计、生产前置条件校验(fail-closed)。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+from gd_common.errors import ConfigError, PolicyValidationError
+from gd_policy.profile import MODE_DEMO, MODE_PROD
+from gd_storage import events
+from selfcheck.registry import PHASE_PROD, run_profile_assertions
+DEMO_MODE_SETTING_KEY = "demo_mode"
+class ModeService:
+    """DEMO ⇄ 等保三生产 状态机(唯一切换入口)。"""
+    def __init__(self, ctx):
+        """@brief 绑定应用上下文"""
+        self._ctx = ctx
+    def _run_http_selfcheck(self) -> list:
+        """@brief 进程内执行 http 级 D4/D5 断言(与 selfcheck_prod 同源 DSL)"""
+        from apps.idp.web import create_app          # 函数内导入避免模块级循环依赖
+        from selfcheck.asgi import AsgiClient
+        from selfcheck.registry import run_http_assertions
+        client = AsgiClient(create_app(self._ctx))
+        _, failures = run_http_assertions(client, PHASE_PROD)
+        return failures
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 10/62 页 ——
+    def _check_prod_preconditions(self):
+        """@brief 生产前置条件(不满足即切换失败并明示原因,H05 §3.2.5)"""
+        if self._ctx.ring.is_demo_key():
+            raise ConfigError("主密钥为演示派生默认值,禁止进入生产模式")
+    def switch_to_prod(self, actor: str, ip: str) -> dict:
+        """
+        @brief  DEMO→生产自动恢复清单(顺序执行、幂等,H05 §3.2)
+        @return 恢复报告(供 /healthz 详情与日志)
+        """
+        self._check_prod_preconditions()
+        previous_mode = self._ctx.profile.mode
+        # 1. 落覆盖并重解析 SecurityProfile:D2–D8 立即失效
+        self._ctx.settings.set_override(DEMO_MODE_SETTING_KEY, False, actor, ip,
+                                        audit_writer=self._ctx.audit)
+        profile = self._ctx.refresh_profile()
+        # 3. 演示账号自动停用(不删、留审计)
+        disabled_count = self._ctx.accounts.disable_demo_accounts(ip)
+        # 4. amr 含 demo 的会话全部吊销
+        revoked_count = self._ctx.sessions.revoke_demo_sessions()
+        # 6. 审计锚点
+        self._ctx.audit.append(actor, events.MODE_CHANGED,
+                               {"from": previous_mode, "to": MODE_PROD}, ip)
+        # 7. 开机自检(fail-closed:任何一项失败即抛错,禁止降级运行)
+        _, failures, _ = run_profile_assertions(profile, PHASE_PROD)
+        failures += self._run_http_selfcheck()
+        if failures:
+            raise ConfigError(f"生产自检失败: {[f['id'] for f in failures]}")
+        return {"mode": profile.mode, "demo_accounts_disabled": disabled_count,
+                "demo_sessions_revoked": revoked_count, "selfcheck": "PASS"}
+    def switch_to_demo(self, actor: str, ip: str, confirm: bool,
+                       reason: str) -> dict:
+        """@brief 生产→DEMO:二次确认+原因强制入审计(H05 §3.3)"""
+        if not confirm or not (reason or "").strip():
+            raise PolicyValidationError("切入 DEMO 必须二次确认并填写原因")
+        _, source = self._ctx.settings.get_with_source(DEMO_MODE_SETTING_KEY)
+        if source == "env":
+            raise PolicyValidationError("运行模式已由环境变量锁定,请修改 env 并重启")
+        previous_mode = self._ctx.profile.mode
+        self._ctx.settings.set_override(DEMO_MODE_SETTING_KEY, True, actor, ip,
+                                        audit_writer=self._ctx.audit)
+        profile = self._ctx.refresh_profile()
+        # 演示账号重新启用并播种;不改动任何生产数据(H05 §3.3)
+        self._ctx.accounts.seed_demo_accounts(profile, ip)
+        self._ctx.audit.append(actor, events.MODE_CHANGED,
+                               {"from": previous_mode, "to": MODE_DEMO,
+                                "reason": reason}, ip)
+        return {"mode": profile.mode}
+===== apps/idp/oidc.py =====
+# -*- coding: utf-8 -*-
+"""
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 11/62 页 ——
+@file    oidc.py
+@brief   OIDC 授权码 + PKCE S256 协议引擎(02-A1/A6):授权码一次性防重放、
+         PKCE 强制、应用访问控制双点拒绝、id_token 携带 groups/amr、
+         access_token 入易失态供 /userinfo、back-channel 登出扇出。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import base64
+import hashlib
+import json
+import secrets
+from gd_crypto import hash_password
+from gd_crypto.password import verify_password
+from gd_storage import make_key
+from apps.idp.tokens import mint_id_token, mint_logout_token
+AUTH_CODE_TTL_SECONDS = 120        # 授权码短时一次性
+ACCESS_TOKEN_TTL_SECONDS = 3600
+ERROR_ACCESS_DENIED = "access_denied"      # 标准错误码(02-A6)
+ERROR_INVALID_GRANT = "invalid_grant"
+ERROR_INVALID_CLIENT = "invalid_client"
+ACCESS_POLICY_ALL = "all"
+ACCESS_POLICY_GROUPS = "groups"
+def _pkce_challenge(verifier: str) -> str:
+    """@brief PKCE S256:BASE64URL(SHA256(verifier))"""
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+class OidcService:
+    """OIDC 协议引擎(与 Web 路由解耦,便于回归测试)。"""
+    def __init__(self, db, store, key_store, suite, issuer: str):
+        """@brief 注入目录库/易失态/签名钥/套件/issuer"""
+        self._db, self._store = db, store
+        self._keys, self._suite = key_store, suite
+        self.issuer = issuer
+    # ---- 应用(RP)目录 ---------------------------------------------------
+    def create_client(self, client_id: str, name: str, redirect_uris: list,
+                      backchannel_url: str = None, access_policy: str = ACCESS_POLICY_ALL,
+                      access_groups: list = None) -> str:
+        """@brief 注册应用,返回一次性明文密钥(库中仅存哈希)"""
+        secret = secrets.token_urlsafe(32)
+        self._db.execute(
+            "INSERT INTO idp_clients(client_id, secret_hash, name, redirect_uris,"
+            " backchannel_url, access_policy, access_groups) VALUES(?,?,?,?,?,?,?)",
+            (client_id, hash_password(secret, self._suite), name,
+             json.dumps(redirect_uris), backchannel_url,
+             access_policy, json.dumps(access_groups or [])))
+        return secret
+    def get_client(self, client_id: str) -> dict:
+        """@brief 读取应用配置"""
+        rows = self._db.query(
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 12/62 页 ——
+            "SELECT client_id, secret_hash, name, redirect_uris, backchannel_url,"
+            " access_policy, access_groups, enabled FROM idp_clients"
+            " WHERE client_id = ?", (client_id,))
+        if not rows:
+            return None
+        keys = ("client_id", "secret_hash", "name", "redirect_uris",
+                "backchannel_url", "access_policy", "access_groups", "enabled")
+        client = dict(zip(keys, rows[0]))
+        client["redirect_uris"] = json.loads(client["redirect_uris"])
+        client["access_groups"] = json.loads(client["access_groups"])
+        return client
+    def check_access(self, client: dict, is_admin: bool, groups: list) -> bool:
+        """@brief 应用访问控制(全员/指定组;管理员始终放行,02-A6)"""
+        if is_admin or client["access_policy"] == ACCESS_POLICY_ALL:
+            return True
+        return bool(set(groups) & set(client["access_groups"]))
+    # ---- authorize / token / userinfo ------------------------------------
+    def issue_auth_code(self, client_id: str, redirect_uri: str, account: str,
+                        amr: list, nonce: str, code_challenge: str) -> str:
+        """@brief 授权通过后签发一次性授权码(载荷入易失态)"""
+        code = secrets.token_urlsafe(32)
+        payload = {"client_id": client_id, "redirect_uri": redirect_uri,
+                   "account": account, "amr": amr, "nonce": nonce,
+                   "code_challenge": code_challenge}
+        self._store.set(make_key("idp", "authcode", code), json.dumps(payload),
+                        ttl_seconds=AUTH_CODE_TTL_SECONDS)
+        return code
+    def validate_authorize(self, client_id: str, redirect_uri: str,
+                           code_challenge: str, method: str) -> tuple:
+        """@brief /authorize 参数校验 @return (client|None, 错误码|None)"""
+        client = self.get_client(client_id)
+        if client is None or not client["enabled"]:
+            return None, ERROR_INVALID_CLIENT
+        if redirect_uri not in client["redirect_uris"]:
+            return None, ERROR_INVALID_CLIENT       # 回调地址白名单精确匹配
+        if not code_challenge or method != "S256":
+            return None, ERROR_INVALID_GRANT        # PKCE S256 强制(H00 G1)
+        return client, None
+    def _authenticate_client(self, client_id: str, client_secret: str) -> dict:
+        """@brief token 端点客户端认证(client_secret_post/basic 同入口)"""
+        client = self.get_client(client_id)
+        if client is None or not client["enabled"]:
+            return None
+        is_ok, _ = verify_password(client_secret or "", client["secret_hash"],
+                                   self._suite)
+        return client if is_ok else None
+    def exchange_code(self, client_id: str, client_secret: str, code: str,
+                      redirect_uri: str, code_verifier: str, user_lookup) -> tuple:
+        """
+        @brief  授权码换令牌:一次性取出授权码、PKCE 校验、铸 id_token
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 13/62 页 ——
+        @param  user_lookup account → (user dict, groups list)
+        @return (响应字典, 错误码|None)
+        """
+        client = self._authenticate_client(client_id, client_secret)
+        if client is None:
+            return None, ERROR_INVALID_CLIENT
+        code_key = make_key("idp", "authcode", code)
+        raw = self._store.get(code_key)
+        self._store.delete(code_key)               # 先删后验:授权码严格一次性
+        if raw is None:
+            return None, ERROR_INVALID_GRANT
+        payload = json.loads(raw)
+        if (payload["client_id"] != client_id
+                or payload["redirect_uri"] != redirect_uri
+                or _pkce_challenge(code_verifier or "") != payload["code_challenge"]):
+            return None, ERROR_INVALID_GRANT
+        user, groups = user_lookup(payload["account"])
+        if user is None:
+            return None, ERROR_INVALID_GRANT
+        id_token = mint_id_token(self.issuer, client_id, user, groups,
+                                 payload["amr"], payload["nonce"], self._keys,
+                                 suite=self._suite)
+        access_token = secrets.token_urlsafe(32)
+        self._store.set(make_key("idp", "access", access_token),
+                        json.dumps({"account": user["account"], "groups": groups,
+                                    "preferred_username": user["display_name"]}),
+                        ttl_seconds=ACCESS_TOKEN_TTL_SECONDS)
+        return {"access_token": access_token, "token_type": "Bearer",
+                "expires_in": ACCESS_TOKEN_TTL_SECONDS, "id_token": id_token}, None
+    def userinfo(self, bearer_token: str) -> dict:
+        """@brief /userinfo:按 access_token 返回声明(无效返回 None)"""
+        raw = self._store.get(make_key("idp", "access", bearer_token))
+        if raw is None:
+            return None
+        info = json.loads(raw)
+        return {"sub": info["account"], "preferred_username":
+                info["preferred_username"], "groups": info["groups"]}
+    # ---- Back-Channel Logout ----------------------------------------------
+    def backchannel_fanout(self, account: str, deliver) -> list:
+        """
+        @brief  向所有配置了 backchannel_url 的应用扇出 logout_token
+        @param  deliver callable(url, logout_token)(注入以便测试与重试策略演进)
+        @return 已扇出的 client_id 列表
+        """
+        rows = self._db.query(
+            "SELECT client_id, backchannel_url FROM idp_clients"
+            " WHERE enabled = 1 AND backchannel_url IS NOT NULL")
+        notified = []
+        for client_id, url in rows:
+            token = mint_logout_token(self.issuer, client_id, account, self._keys,
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 14/62 页 ——
+                                      suite=self._suite)
+            deliver(url, token)
+            notified.append(client_id)
+        return notified
+    def discovery_document(self) -> dict:
+        """@brief OIDC 发现文档(02-A1 端点契约)"""
+        return {
+            "issuer": self.issuer,
+            "authorization_endpoint": self.issuer + "/authorize",
+            "token_endpoint": self.issuer + "/token",
+            "userinfo_endpoint": self.issuer + "/userinfo",
+            "jwks_uri": self.issuer + "/jwks.json",
+            "end_session_endpoint": self.issuer + "/logout",
+            "response_types_supported": ["code"],
+            "code_challenge_methods_supported": ["S256"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+        }
+===== apps/idp/sessions.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    sessions.py
+@brief   IdP 会话服务(H08 sessions / ARC-4):会话一律入共享易失态(生产 Redis),
+         空闲+绝对双超时(H03 §3),支持按用户吊销与按 demo 标记吊销(H05 §3.2.4)。
+         设计说明:按用户/按标记吊销依赖 gd:idp:sess_index 会话索引键(JSON 列表,
+         读改写;IdP 会话规模下竞态窗口可接受,写入失败 fail-closed)。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import json
+import secrets
+import time
+from gd_storage import make_key
+AMR_DEMO_MARK = "demo"          # 演示登录方式标记(测试码/演示账号会话)
+SESSION_INDEX_KEY = make_key("idp", "sess", "__index__")
+SESSION_INDEX_TTL = 86400 * 8   # 索引键 TTL(略大于最长绝对会话期)
+class SessionService:
+    """IdP 人机会话(sid → 会话记录,全易失态)。"""
+    def __init__(self, store, profile):
+        """@brief 注入易失态存储与生效策略快照"""
+        self._store = store
+        self._profile = profile
+    def _absolute_ttl(self) -> int:
+        """@brief 绝对有效期秒数(session_max_hours)"""
+        return self._profile.session_max_hours * 3600
+    def create(self, account: str, amr: list, now: float = None) -> str:
+        """@brief 建立会话,返回 sid(HttpOnly Cookie 值)"""
+        sid = secrets.token_urlsafe(32)
+        created = now if now is not None else time.time()
+        record = {"account": account, "amr": amr, "created": created,
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 15/62 页 ——
+                  "last_seen": created}
+        self._store.set(make_key("idp", "sess", sid), json.dumps(record),
+                        ttl_seconds=self._absolute_ttl())
+        index = self._load_index()
+        index.append(sid)
+        self._store.set(SESSION_INDEX_KEY, json.dumps(index),
+                        ttl_seconds=SESSION_INDEX_TTL)
+        return sid
+    def get(self, sid: str, now: float = None) -> dict:
+        """@brief 取会话并执行空闲/绝对双超时(过期返回 None 并清除)"""
+        if not sid:
+            return None
+        raw = self._store.get(make_key("idp", "sess", sid))
+        if raw is None:
+            return None
+        record = json.loads(raw)
+        moment = now if now is not None else time.time()
+        idle_limit = self._profile.session_idle_minutes * 60
+        if (moment - record["last_seen"] > idle_limit
+                or moment - record["created"] > self._absolute_ttl()):
+            self.revoke(sid)
+            return None
+        record["last_seen"] = moment      # 滚动空闲计时
+        self._store.set(make_key("idp", "sess", sid), json.dumps(record),
+                        ttl_seconds=self._absolute_ttl())
+        return record
+    def revoke(self, sid: str):
+        """@brief 吊销单个会话"""
+        self._store.delete(make_key("idp", "sess", sid))
+    def _load_index(self) -> list:
+        """@brief 装载会话索引(缺失即空)"""
+        raw = self._store.get(SESSION_INDEX_KEY)
+        return json.loads(raw) if raw else []
+    def _revoke_matching(self, predicate) -> int:
+        """@brief 按谓词批量吊销,并压缩索引 @return 吊销数"""
+        index, kept, revoked = self._load_index(), [], 0
+        for sid in index:
+            raw = self._store.get(make_key("idp", "sess", sid))
+            if raw is None:
+                continue
+            if predicate(json.loads(raw)):
+                self.revoke(sid)
+                revoked += 1
+            else:
+                kept.append(sid)
+        self._store.set(SESSION_INDEX_KEY, json.dumps(kept),
+                        ttl_seconds=SESSION_INDEX_TTL)
+        return revoked
+    def revoke_user(self, account: str) -> int:
+        """@brief 吊销某用户全部会话(停用/重置即刻断线,H04 §二.b)"""
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 16/62 页 ——
+        return self._revoke_matching(lambda rec: rec["account"] == account)
+    def revoke_demo_sessions(self) -> int:
+        """@brief 吊销 amr 含 demo 标记的全部会话(H05 §3.2.4)"""
+        return self._revoke_matching(lambda rec: AMR_DEMO_MARK in rec.get("amr", []))
+===== apps/idp/tokens.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    tokens.py
+@brief   OIDC 令牌铸造(IdP 侧):JWT 编码(id_token / logout_token),签名算法
+         随套件——intl=RS256、gm=SM2SM3(H04 §8.1),header 携带 kid。
+         验签在 RP 侧库 gd_sso_client.jwt_verify(按 JWKS kid 选钥选算法)。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import base64
+import json
+import secrets
+import time
+from apps.idp.keys import ServerKeyStore
+from gd_crypto.suites import ICryptoSuite, SUITE_GM
+JWT_ALG_RS256 = "RS256"
+JWT_ALG_SM2SM3 = "SM2SM3"
+ID_TOKEN_TTL_SECONDS = 600          # 授权码流中 id_token 短时有效(RP 立即换会话)
+BACKCHANNEL_LOGOUT_EVENT = "http://schemas.openid.net/event/backchannel-logout"
+def b64url_encode(raw: bytes) -> str:
+    """@brief 无填充 base64url 编码(RFC 7515)"""
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+def encode_jwt(claims: dict, key_store: ServerKeyStore,
+               suite: ICryptoSuite = None) -> str:
+    """
+    @brief  JWT 编码,签名算法随套件(缺省 intl→RS256),header 携带 kid
+            (存量兼容与双套件切换依据,H04 §8.2.3)
+    @param  claims    载荷声明
+    @param  key_store 服务器签名密钥仓
+    @param  suite     当前套件(gm→SM2SM3)
+    @return JWT 字符串
+    """
+    use_gm = suite is not None and suite.name == SUITE_GM
+    header = {"alg": JWT_ALG_SM2SM3 if use_gm else JWT_ALG_RS256, "typ": "JWT",
+              "kid": key_store.sm2_kid if use_gm else key_store.kid}
+    signing_input = (b64url_encode(json.dumps(header, separators=(",", ":")).encode())
+                     + "." +
+                     b64url_encode(json.dumps(claims, separators=(",", ":")).encode()))
+    if use_gm:
+        signature = key_store.sign_sm2(signing_input.encode("ascii"))
+    else:
+        signature = key_store.sign_rs256(signing_input.encode("ascii"))
+    return signing_input + "." + b64url_encode(signature)
+def mint_id_token(issuer: str, client_id: str, user: dict, groups: list,
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 17/62 页 ——
+                  amr: list, nonce: str, key_store: ServerKeyStore,
+                  now: float = None, suite: ICryptoSuite = None) -> str:
+    """@brief 铸造 id_token(携带 groups/preferred_username/amr,02-A1)"""
+    issued_at = int(now if now is not None else time.time())
+    claims = {
+        "iss": issuer, "aud": client_id, "sub": user["account"],
+        "iat": issued_at, "exp": issued_at + ID_TOKEN_TTL_SECONDS,
+        "preferred_username": user["display_name"], "groups": groups,
+        "amr": amr, "nonce": nonce,
+    }
+    return encode_jwt(claims, key_store, suite)
+def mint_logout_token(issuer: str, client_id: str, account: str,
+                      key_store: ServerKeyStore, now: float = None,
+                      suite: ICryptoSuite = None) -> str:
+    """@brief 铸造 back-channel logout_token(OIDC Back-Channel Logout)"""
+    issued_at = int(now if now is not None else time.time())
+    claims = {
+        "iss": issuer, "aud": client_id, "sub": account,
+        "iat": issued_at, "jti": secrets.token_hex(8),
+        "events": {BACKCHANNEL_LOGOUT_EVENT: {}},
+    }
+    return encode_jwt(claims, key_store, suite)
+===== apps/idp/totp.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    totp.py
+@brief   TOTP 动态口令(RFC 6238 / HMAC-SHA1,H04 §8.1 双套件同此实现):
+         30 秒步长、6 位码、±1 步时间窗容忍(部署 NTP 见 H04 §九,06-E9)
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import base64
+import hashlib
+import hmac
+import secrets
+import struct
+import time
+TOTP_STEP_SECONDS = 30
+TOTP_DIGITS = 6
+TOTP_WINDOW_STEPS = 1        # 允许前后各 1 个时间步(时钟偏移容忍)
+TOTP_SECRET_BYTES = 20
+def generate_totp_secret() -> str:
+    """@brief 生成 base32 TOTP 密钥(绑定二维码用,密钥不出内网)"""
+    return base64.b32encode(secrets.token_bytes(TOTP_SECRET_BYTES)).decode("ascii")
+def totp_code(secret_base32: str, timestamp: float = None,
+              step_offset: int = 0) -> str:
+    """
+    @brief  计算指定时间步的 TOTP 码
+    @param  secret_base32 base32 密钥
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 18/62 页 ——
+    @param  timestamp     计算时刻(缺省当前)
+    @param  step_offset   时间步偏移(验证窗口用)
+    @return 6 位数字码
+    """
+    counter = int((timestamp if timestamp is not None else time.time())
+                  // TOTP_STEP_SECONDS) + step_offset
+    key = base64.b32decode(secret_base32, casefold=True)
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    code_int = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(code_int % (10 ** TOTP_DIGITS)).zfill(TOTP_DIGITS)
+def verify_totp(secret_base32: str, code: str, timestamp: float = None) -> bool:
+    """@brief 在 ±TOTP_WINDOW_STEPS 窗口内校验动态码(恒定时间比较)"""
+    for step_offset in range(-TOTP_WINDOW_STEPS, TOTP_WINDOW_STEPS + 1):
+        expected = totp_code(secret_base32, timestamp, step_offset)
+        if hmac.compare_digest(expected, str(code)):
+            return True
+    return False
+===== apps/idp/web.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    web.py
+@brief   IdP Web 核心路由(02-A1/A2/A5):OIDC 五端点、口令/TOTP/短信登录、
+         D4 证书测试入口与 D5 微信模拟(生产 404)、/portal、/healthz、
+         X-Request-Id 中间件、DEMO 横幅注入。管理台见 web_admin.py。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import html
+import json
+import secrets
+import urllib.parse
+import uuid
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from gd_common.jsonlog import get_logger, request_id_var
+from gd_crypto import issue_context, verify_context
+from gd_common.errors import (
+    ExpiredContextError, InvalidContextError, PolicyValidationError,
+)
+from gd_crypto.context_token import renew_context
+from apps.idp import accounts as acc
+from apps.idp.context import IdpContext
+from apps.idp.sessions import AMR_DEMO_MARK
+from apps.idp.forms import read_form
+from apps.idp.web_admin import build_admin_router
+_log = get_logger("idp.web")
+SESSION_COOKIE = "gd_idp_sid"
+LOGIN_CONTEXT_TTL = 1800          # 登录上下文 30 分钟(02-A3)
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 19/62 页 ——
+HTTP_NOT_FOUND = 404
+HTTP_LOCKED = 423
+HTTP_UNAUTHORIZED = 401
+# 浏览器人话报错文案(06-E18:PRG 后经 ?err= 渲染,禁止对浏览器回裸 JSON)
+_LOGIN_ERR_TEXT = {
+    "cred": "用户名或口令错误(启用动态码的账户须同时填写动态码)",
+    "locked": "账号已锁定,请稍后再试或联系管理员解锁",
+    "ctx": "登录上下文无效或已过期,请回到业务系统重新发起登录",
+}
+def _login_page_html(ctx: IdpContext, rid: str = "", err: str = "",
+                     changed: bool = False) -> str:
+    """
+    @brief  登录页:可操作极简表单(06-E18)。含账号/口令/动态码输入与提交按钮、
+            隐藏 rid 透传(06-E19:SSO 授权链不断),err/changed 人话提示。
+    @param  rid     authorize 302 带来的登录上下文(html.escape 后回显)
+    @param  err     PRG 错误码(cred|locked|ctx)
+    @param  changed True=改密成功提示
+    """
+    banner = ctx.profile.banner_text
+    color = "#c62828" if ctx.profile.is_demo else "#2e7d32"
+    tabs = "口令|短信|TOTP|微信|证书"
+    notice = ("<p id='login-notice' style='color:#2e7d32'>"
+              "口令修改成功,请使用新口令登录</p>" if changed else "")
+    err_text = _LOGIN_ERR_TEXT.get(err, "")
+    err_html = (f"<p id='login-error' style='color:#c62828'>{err_text}</p>"
+                if err_text else "")
+    rid_safe = html.escape(rid, quote=True)
+    return (f"<!doctype html><html><head><meta charset='utf-8'>"
+            f"<title>港电统一登录</title></head><body>"
+            f"<div style='background:{color};color:#fff'>{banner}</div>"
+            f"<div id='login-tabs' hidden>{tabs}</div>"
+            f"<style>[hidden]{{display:none}}</style>"       # 06-E3 兜底条款
+            f"<h3>统一身份认证</h3>{notice}{err_html}"
+            f"<form id='login-form' method='post' action='/login'>"
+            f"<input type='hidden' name='rid' value='{rid_safe}'>"
+            f"<label>账号 <input name='account' autocomplete='username'></label>"
+            f"<label>口令 <input name='password' type='password'"
+            f" autocomplete='current-password'></label>"
+            f"<label>动态码 <input name='totp_code'"
+            f" placeholder='未开启可留空'></label>"
+            f"<button type='submit' id='login-submit'>登 录</button>"
+            f"</form>"
+            f"<script>document.getElementById('login-form');</script>"
+            f"</body></html>")
+def _login_redirect(rid: str, err: str):
+    """@brief 浏览器登录失败 PRG:303 回登录页,rid 原样透传(06-E19)"""
+    query = urllib.parse.urlencode(
+        {key: value for key, value in (("err", err), ("rid", rid)) if value})
+    return RedirectResponse(f"/login?{query}", status_code=303)
+def _set_session_cookie(response: Response, ctx: IdpContext, sid: str):
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 20/62 页 ——
+    """@brief 下发会话 Cookie(生产强制 Secure,禁以关 Secure 修登录,06-E13)"""
+    response.set_cookie(SESSION_COOKIE, sid, httponly=True, samesite="lax",
+                        secure=ctx.profile.cookie_secure_required)
+def _issue_login_context(ctx: IdpContext, payload: dict) -> str:
+    """@brief 签发无状态登录上下文 rid(02-A3,重启/多实例可验签还原)"""
+    return issue_context(payload, ctx.ring.current_key, ctx.suite,
+                         LOGIN_CONTEXT_TTL)
+def _restore_login_context(ctx: IdpContext, rid: str) -> tuple:
+    """@brief 还原登录上下文;过期自动续签而非死路(06-E2) @return (载荷, 新rid|None)"""
+    try:
+        return verify_context(rid, ctx.ring.current_key, ctx.suite), None
+    except ExpiredContextError as exc:
+        renewed = renew_context(exc.payload, ctx.ring.current_key, ctx.suite,
+                                LOGIN_CONTEXT_TTL)
+        return exc.payload, renewed
+def create_app(ctx: IdpContext) -> FastAPI:
+    """@brief 组装 IdP FastAPI 应用(上下文注入,便于测试构造)"""
+    app = FastAPI(title="港电统一认证中心", docs_url=None, redoc_url=None)
+    # ---- F1 安全头固化(H11 §一/§四.4,里程碑 9) ------------------------
+    #   /admin*:零 JS CSP(default-src 'none',脚本全禁);
+    #   其余 HTML:同源 CSP,仅放行登录页最小渐进增强内联脚本(F1 特许)。
+    _CSP_ADMIN = ("default-src 'none'; style-src 'unsafe-inline'; "
+                  "img-src 'self' data:; form-action 'self'; "
+                  "base-uri 'none'; frame-ancestors 'none'")
+    #   注:登录成功后 302 续接授权链跨源落回 RP,form-action 会拦截
+    #   表单提交后的重定向链(Chrome 语义),故页面级 CSP 不设 form-action。
+    _CSP_PAGE = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                 "style-src 'unsafe-inline'; img-src 'self' data:; "
+                 "base-uri 'self'; frame-ancestors 'self'")
+    @app.middleware("http")
+    async def f1_security_headers(request, call_next):
+        """@brief F1 页面安全头(HTML 响应统一附;/admin 零 JS 更严)"""
+        response = await call_next(request)
+        ctype = response.headers.get("content-type", "")
+        if "text/html" in ctype:
+            path = request.url.path
+            response.headers["Content-Security-Policy"] = (
+                _CSP_ADMIN if path.startswith("/admin") else _CSP_PAGE)
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["Referrer-Policy"] = "same-origin"
+        return response
+    app.state.ctx = ctx
+    app.include_router(build_admin_router(ctx))
+    @app.middleware("http")
+    async def request_id_middleware(request: Request, call_next):
+        """@brief X-Request-Id 全链路贯通(ARC-6)+ 设置版本轮询(G.4)"""
+        request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:16]
+        request_id_var.set(request_id)
+        ctx.maybe_refresh()      # 他实例改策略后本实例下一请求即热生效
+        response = await call_next(request)
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 21/62 页 ——
+        response.headers["X-Request-Id"] = request_id
+        return response
+    # ---- OIDC 五端点(02-A1) -------------------------------------------
+    @app.get("/.well-known/openid-configuration")
+    def discovery():
+        """@brief OIDC 发现文档"""
+        return ctx.oidc.discovery_document()
+    @app.get("/jwks.json")
+    def jwks():
+        """@brief JWKS 公钥发布"""
+        return ctx.keys.jwks()
+    @app.get("/authorize")
+    def authorize(request: Request, client_id: str = "", redirect_uri: str = "",
+                  state: str = "", nonce: str = "", code_challenge: str = "",
+                  code_challenge_method: str = "", response_type: str = "code"):
+        """@brief 授权端点:未登录带 rid 转登录页;已登录校验访问策略并发码"""
+        client, error = ctx.oidc.validate_authorize(
+            client_id, redirect_uri, code_challenge, code_challenge_method)
+        if error:
+            return JSONResponse({"error": error}, status_code=400)
+        session = ctx.sessions.get(request.cookies.get(SESSION_COOKIE))
+        if session is None:
+            rid = _issue_login_context(ctx, {
+                "client_id": client_id, "redirect_uri": redirect_uri,
+                "state": state, "nonce": nonce, "code_challenge": code_challenge})
+            return RedirectResponse(f"/login?rid={rid}", status_code=302)
+        user = ctx.accounts.get_user(session["account"])
+        groups = ctx.accounts.user_groups(user["id"])
+        if not ctx.oidc.check_access(client, bool(user["is_admin"]), groups):
+            return RedirectResponse(
+                f"{redirect_uri}?error=access_denied&state={state}", status_code=302)
+        code = ctx.oidc.issue_auth_code(client_id, redirect_uri, user["account"],
+                                        session["amr"], nonce, code_challenge)
+        return RedirectResponse(f"{redirect_uri}?code={code}&state={state}",
+                                status_code=302)
+    @app.post("/token")
+    async def token(request: Request):
+        """@brief 令牌端点(授权码换 id_token/access_token)"""
+        form = await read_form(request)
+        if form.get("grant_type") != "authorization_code":
+            return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+        result, error = ctx.oidc.exchange_code(
+            form.get("client_id", ""), form.get("client_secret", ""),
+            form.get("code", ""), form.get("redirect_uri", ""),
+            form.get("code_verifier", ""), ctx.user_lookup)
+        if error:
+            return JSONResponse({"error": error}, status_code=400)
+        return result
+    @app.get("/userinfo")
+    def userinfo(request: Request):
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 22/62 页 ——
+        """@brief 用户信息端点(Bearer access_token)"""
+        auth_header = request.headers.get("authorization", "")
+        info = ctx.oidc.userinfo(auth_header.removeprefix("Bearer ").strip())
+        if info is None:
+            return JSONResponse({"error": "invalid_token"},
+                                status_code=HTTP_UNAUTHORIZED)
+        return info
+    @app.get("/logout")
+    def logout(request: Request):
+        """@brief 登出:吊销本端会话并向各 RP back-channel 扇出"""
+        sid = request.cookies.get(SESSION_COOKIE)
+        session = ctx.sessions.get(sid)
+        if session:
+            ctx.sessions.revoke(sid)
+            deliveries = []
+            ctx.oidc.backchannel_fanout(
+                session["account"],
+                lambda url, token: deliveries.append((url, token)))
+            app.state.pending_backchannel = deliveries   # 投递由部署侧 worker 消费
+        response = RedirectResponse("/login", status_code=302)
+        response.delete_cookie(SESSION_COOKIE)
+        return response
+    # ---- 登录(口令/TOTP/短信;02-A2) -----------------------------------
+    @app.get("/login", response_class=HTMLResponse)
+    def login_page(rid: str = "", err: str = "", changed: str = ""):
+        """@brief 登录页(含 DEMO/生产横幅,05-D9;rid 透传+PRG 提示,06-E18/E19)"""
+        return _login_page_html(ctx, rid=rid, err=err, changed=changed == "1")
+    def _complete_login(user: dict, rid_payload: dict, method: str,
+                        amr_extra: list = None):
+        """@brief 建会话+回跳 OIDC 流程(若来自 authorize)"""
+        amr = [method] + (amr_extra or [])
+        if ctx.profile.is_demo and user["status"] == acc.STATUS_DEMO:
+            amr.append(AMR_DEMO_MARK)
+        ctx.accounts.finish_login(user, "0.0.0.0", method)
+        sid = ctx.sessions.create(user["account"], amr)
+        if rid_payload and rid_payload.get("client_id"):
+            target = ("/authorize?client_id={client_id}&redirect_uri={redirect_uri}"
+                      "&state={state}&nonce={nonce}&code_challenge={code_challenge}"
+                      "&code_challenge_method=S256").format(**rid_payload)
+        else:
+            target = "/portal"
+        response = RedirectResponse(target, status_code=302)
+        _set_session_cookie(response, ctx, sid)
+        return response
+    @app.post("/login")
+    async def login_password(request: Request):
+        """@brief 口令登录(启用 TOTP 的账户=口令+动态码两步)"""
+        form = await read_form(request)
+        account, password = form.get("account", ""), form.get("password", "")
+        totp_code, rid = form.get("totp_code", ""), form.get("rid", "")
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 23/62 页 ——
+        wants_html = "text/html" in request.headers.get("accept", "")
+        rid_payload = None
+        if rid:
+            try:
+                rid_payload, _ = _restore_login_context(ctx, rid)
+            except InvalidContextError:
+                if wants_html:                      # 06-E18:浏览器走 PRG 人话报错
+                    return _login_redirect("", "ctx")
+                return JSONResponse({"error": "登录上下文无效"}, status_code=400)
+        result, user = ctx.accounts.password_login_step(
+            account, password, ctx.profile, "0.0.0.0")
+        if result == acc.LOGIN_LOCKED:
+            if wants_html:
+                return _login_redirect(rid, "locked")
+            return JSONResponse(
+                {"error": f"账号已锁定,请 {ctx.profile.lockout_minutes} 分钟后再试"},
+                status_code=HTTP_LOCKED)
+        if result == acc.LOGIN_FAILED:
+            if wants_html:
+                return _login_redirect(rid, "cred")
+            return JSONResponse({"error": "用户名或口令错误"},
+                                status_code=HTTP_UNAUTHORIZED)
+        if result == acc.LOGIN_NEED_TOTP:
+            if not ctx.accounts.verify_totp_step(user, totp_code, ctx.profile,
+                                                 "0.0.0.0"):
+                if wants_html:
+                    return _login_redirect(rid, "cred")
+                return JSONResponse({"error": "用户名或口令错误"},
+                                    status_code=HTTP_UNAUTHORIZED)
+        if result == acc.LOGIN_MUST_CHANGE:
+            # 口令已验证正确 → 签发改密票据(无状态上下文,5 分钟)
+            ticket = _issue_login_context(
+                ctx, {"purpose": "pwd_change", "account": user["account"]})
+            if "text/html" in request.headers.get("accept", ""):
+                return RedirectResponse(
+                    f"/account/password?rid={ticket}", status_code=303)
+            return JSONResponse({"error": "首次登录必须修改口令",
+                                 "next": "/account/password",
+                                 "rid": ticket}, status_code=403)
+        return _complete_login(user, rid_payload, "pwd")
+    @app.get("/account/password", response_class=HTMLResponse)
+    def password_page(rid: str = ""):
+        """@brief 改密页(首登强改/口令到期共用;极简页,完整 UI 随里程碑 9)"""
+        account_hint = ""
+        if rid:
+            try:
+                payload, _ = _restore_login_context(ctx, rid)
+                if payload.get("purpose") == "pwd_change":
+                    account_hint = payload.get("account", "")
+            except InvalidContextError:
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 24/62 页 ——
+                rid = ""
+        return (f"<!doctype html><html><body>"
+                f"<h3>修改口令</h3>"
+                f"<p>口令须 ≥{ctx.profile.password_min_length} 位且含"
+                f"大小写/数字/符号至少三类</p>"
+                f"<form method='post' action='/account/password'>"
+                f"<input type='hidden' name='rid' value='{rid}'>"
+                f"<input name='account' placeholder='账号'"
+                f" value='{account_hint}'{' readonly' if account_hint else ''}>"
+                f"<input name='old_password' type='password' placeholder='原口令'>"
+                f"<input name='new_password' type='password' placeholder='新口令'>"
+                f"<input name='confirm_password' type='password'"
+                f" placeholder='确认新口令'>"
+                f"<input name='totp_code' placeholder='动态码(未开启可留空)'>"
+                f"<button type='submit'>修改并返回登录</button>"
+                f"</form></body></html>")
+    @app.post("/account/password")
+    async def password_change(request: Request):
+        """
+        @brief  自助改密(旧口令即认证,失败复用锁定计数;启用 TOTP 的账户
+                须附动态码)。浏览器 303 回登录页,API 返回 JSON。
+        """
+        form = await read_form(request)
+        account = form.get("account", "")
+        old_password = form.get("old_password", "")
+        new_password = form.get("new_password", "")
+        wants_html = "text/html" in request.headers.get("accept", "")
+        if new_password != form.get("confirm_password", ""):
+            return JSONResponse({"error": "两次输入的新口令不一致"},
+                                status_code=400)
+        if new_password == old_password:
+            return JSONResponse({"error": "新口令不得与原口令相同"},
+                                status_code=400)
+        result, user = ctx.accounts.password_login_step(
+            account, old_password, ctx.profile, "0.0.0.0")
+        if result == acc.LOGIN_LOCKED:
+            return JSONResponse(
+                {"error": f"账号已锁定,请 {ctx.profile.lockout_minutes} 分钟后再试"},
+                status_code=HTTP_LOCKED)
+        if result == acc.LOGIN_FAILED:
+            return JSONResponse({"error": "账号或原口令错误"},
+                                status_code=HTTP_UNAUTHORIZED)
+        if result == acc.LOGIN_NEED_TOTP:
+            if not ctx.accounts.verify_totp_step(
+                    user, form.get("totp_code", ""), ctx.profile, "0.0.0.0"):
+                return JSONResponse({"error": "动态码缺失或错误"},
+                                    status_code=HTTP_UNAUTHORIZED)
+        try:
+            ctx.accounts.change_password(account, new_password, ctx.profile,
+                                         account, "0.0.0.0")
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 25/62 页 ——
+        except PolicyValidationError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        if wants_html:
+            return RedirectResponse("/login?changed=1", status_code=303)
+        return {"changed": True, "next": "/login"}
+    @app.post("/login/sms/send")
+    async def sms_send(request: Request):
+        """@brief 发送短信验证码(D3:DEMO 回显,生产不出现在响应/日志)"""
+        account = (await read_form(request)).get("account", "")
+        if not ctx.profile.method_sms:
+            return JSONResponse({"error": "短信登录未启用"}, status_code=HTTP_NOT_FOUND)
+        echo = ctx.accounts.send_sms_code(account, ctx.profile)
+        body = {"sent": True}
+        if echo is not None:
+            body["demo_echo_code"] = echo
+        return body
+    @app.post("/login/sms/verify")
+    async def sms_verify(request: Request):
+        """@brief 短信验证码登录"""
+        form = await read_form(request)
+        account, code, rid = (form.get("account", ""), form.get("code", ""),
+                              form.get("rid", ""))
+        if not ctx.profile.method_sms:
+            return JSONResponse({"error": "短信登录未启用"}, status_code=HTTP_NOT_FOUND)
+        if ctx.accounts.is_locked(account):
+            return JSONResponse({"error": "账号已锁定"}, status_code=HTTP_LOCKED)
+        user = ctx.accounts.get_user(account)
+        if user is None or not ctx.accounts.verify_sms_code(account, code,
+                                                            ctx.profile, "0.0.0.0"):
+            return JSONResponse({"error": "验证码错误"}, status_code=HTTP_UNAUTHORIZED)
+        rid_payload = None
+        if rid:
+            rid_payload, _ = _restore_login_context(ctx, rid)
+        return _complete_login(user, rid_payload, "sms")
+    # ---- D4/D5 模拟入口(仅 DEMO;生产 404,05-D4/D5) --------------------
+    @app.get("/login/cert-demo")
+    def cert_demo():
+        """@brief 证书测试入口(粘贴 PEM 模拟 mTLS;生产自动关闭)"""
+        if not ctx.profile.cert_demo_endpoint_enabled:
+            return JSONResponse({"error": "not found"}, status_code=HTTP_NOT_FOUND)
+        return HTMLResponse("<form id='cert-demo'>粘贴 PEM 测试 mTLS 流程</form>")
+    @app.get("/wx/scan")
+    def wechat_scan():
+        """@brief 微信模拟扫码入口(DEMO 内置闭环;生产未配置整体隐藏)"""
+        if not ctx.profile.wechat_mock_enabled:
+            return JSONResponse({"error": "not found"}, status_code=HTTP_NOT_FOUND)
+        return {"scene": secrets.token_hex(8), "mock": True}
+    # ---- 门户与运维 -------------------------------------------------------
+    @app.get("/portal")
+    def portal(request: Request):
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 26/62 页 ——
+        """@brief 企业门户:按权限展示应用卡片(02-A5)"""
+        session = ctx.sessions.get(request.cookies.get(SESSION_COOKIE))
+        if session is None:
+            return RedirectResponse("/login", status_code=302)
+        user = ctx.accounts.get_user(session["account"])
+        groups = ctx.accounts.user_groups(user["id"])
+        rows = ctx.db.query("SELECT client_id, name, access_policy, access_groups,"
+                            " enabled FROM idp_clients")
+        cards = []
+        for client_id, name, policy, access_groups, enabled in rows:
+            client = {"access_policy": policy,
+                      "access_groups": json.loads(access_groups)}
+            if enabled and ctx.oidc.check_access(client, bool(user["is_admin"]),
+                                                 groups):
+                cards.append({"client_id": client_id, "name": name})
+        if "text/html" in request.headers.get("accept", ""):
+            # 06-E18:浏览器渲染 HTML 卡片页(账号/应用名 html.escape 防注入)
+            items = "".join(
+                f"<li class='app-card'>{html.escape(card['name'])}</li>"
+                for card in cards)
+            return HTMLResponse(
+                f"<!doctype html><html><head><meta charset='utf-8'>"
+                f"<title>企业门户</title></head><body>"
+                f"<div>{html.escape(ctx.profile.banner_text)}</div>"
+                f"<h3 id='portal-title'>企业门户 · "
+                f"{html.escape(user['account'])}</h3>"
+                f"<ul id='portal-apps'>{items}</ul>"
+                f"<a href='/logout'>退出登录</a></body></html>")
+        return {"banner": ctx.profile.banner_text, "apps": cards,
+                "account": user["account"]}
+    @app.get("/healthz")
+    def healthz():
+        """@brief 健康检查:一律返回运行模式与当前密码套件(ARC-6 / 05 §2)"""
+        return {"status": "ok", "mode": ctx.profile.mode,
+                "crypto_suite": ctx.profile.crypto_suite_name,
+                "kid": ctx.keys.kid}
+    return app
+===== apps/idp/web_admin.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    web_admin.py
+@brief   管理台五区路由(02-A4):用户/组/应用/链接/审计;全部 POST 带 CSRF 令牌、
+         留审计;末位 admin 守护与防自锁总则(H03 §4);模式切换页(H05 §3)。
+         本里程碑以 JSON API 形态交付,页面渲染随里程碑 9 前端统一。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import secrets
+from fastapi import APIRouter, Request
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 27/62 页 ——
+from fastapi.responses import JSONResponse
+from gd_common.errors import PlatformError
+from gd_storage import events, make_key, verify_chain
+from apps.idp.forms import form_bool, read_form
+from apps.idp.mode import ModeService
+CSRF_TTL_SECONDS = 3600
+HTTP_FORBIDDEN = 403
+HTTP_UNAUTHORIZED = 401
+SESSION_COOKIE = "gd_idp_sid"        # 与 web.py 保持一致(单一 Cookie 名)
+def build_admin_router(ctx) -> APIRouter:
+    """@brief 组装 /admin 路由(上下文闭包注入)"""
+    router = APIRouter(prefix="/admin")
+    mode_service = ModeService(ctx)
+    def _require_admin(request: Request):
+        """@brief 管理员会话校验 @return (user, 错误响应|None)"""
+        session = ctx.sessions.get(request.cookies.get(SESSION_COOKIE))
+        if session is None:
+            return None, JSONResponse({"error": "未登录"},
+                                      status_code=HTTP_UNAUTHORIZED)
+        user = ctx.accounts.get_user(session["account"])
+        if user is None or not user["is_admin"]:
+            return None, JSONResponse({"error": "需要管理员权限"},
+                                      status_code=HTTP_FORBIDDEN)
+        return user, None
+    def _check_csrf(request: Request, csrf_token: str):
+        """@brief CSRF 令牌校验(管理操作全覆盖,H03 §3)"""
+        sid = request.cookies.get(SESSION_COOKIE, "")
+        stored = ctx.store.get(make_key("idp", "csrf", sid))
+        if not stored or stored != csrf_token:
+            return JSONResponse({"error": "CSRF 校验失败"},
+                                status_code=HTTP_FORBIDDEN)
+        return None
+    @router.get("/csrf")
+    def csrf_token(request: Request):
+        """@brief 为当前管理员会话签发 CSRF 令牌"""
+        user, error = _require_admin(request)
+        if error:
+            return error
+        sid = request.cookies.get(SESSION_COOKIE)
+        token = secrets.token_urlsafe(24)
+        ctx.store.set(make_key("idp", "csrf", sid), token,
+                      ttl_seconds=CSRF_TTL_SECONDS)
+        return {"csrf_token": token}
+    # ---- 用户区 -----------------------------------------------------------
+    @router.post("/users/create")
+    async def user_create(request: Request):
+        """@brief 建号(首登强改密)"""
+        user, error = _require_admin(request)
+        if error:
+            return error
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 28/62 页 ——
+        form = await read_form(request)
+        error = _check_csrf(request, form.get("csrf_token", ""))
+        if error:
+            return error
+        try:
+            ctx.accounts.create_user(
+                form.get("account", ""), form.get("display_name", ""),
+                form.get("password", ""), ctx.profile, user["account"], "0.0.0.0",
+                is_admin=form_bool(form, "is_admin"))
+        except PlatformError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return {"created": form.get("account", "")}
+    def _admin_count_excluding(account: str) -> int:
+        """@brief 除指定账号外的可用管理员数(末位 admin 守护依据)"""
+        rows = ctx.db.query(
+            "SELECT COUNT(*) FROM idp_users WHERE is_admin = 1"
+            " AND status = 'active' AND account != ?", (account,))
+        return rows[0][0]
+    @router.post("/users/disable")
+    async def user_disable(request: Request):
+        """@brief 停用账号(即刻断线;末位 admin 守护,H03 §4)"""
+        user, error = _require_admin(request)
+        if error:
+            return error
+        form = await read_form(request)
+        account = form.get("account", "")
+        error = _check_csrf(request, form.get("csrf_token", ""))
+        if error:
+            return error
+        target = ctx.accounts.get_user(account)
+        if target is None:
+            return JSONResponse({"error": "账号不存在"}, status_code=404)
+        if target["is_admin"] and _admin_count_excluding(account) == 0:
+            return JSONResponse(
+                {"error": "禁止停用最后一名管理员(末位 admin 守护)"},
+                status_code=400)
+        ctx.db.execute("UPDATE idp_users SET status = 'disabled' WHERE account = ?",
+                       (account,))
+        ctx.sessions.revoke_user(account)     # 停用即刻断线(H04 §二.b)
+        ctx.audit.append(user["account"], events.USER_DISABLED,
+                         {"account": account}, "0.0.0.0")
+        return {"disabled": account}
+    @router.post("/users/unlock")
+    async def user_unlock(request: Request):
+        """@brief 管理员立即解锁(只解锁不改密,06-E5)"""
+        user, error = _require_admin(request)
+        if error:
+            return error
+        form = await read_form(request)
+        error = _check_csrf(request, form.get("csrf_token", ""))
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 29/62 页 ——
+        if error:
+            return error
+        account = form.get("account", "")
+        ctx.accounts.admin_unlock(account, user["account"], "0.0.0.0")
+        return {"unlocked": account}
+    # ---- 应用区 / 链接区 --------------------------------------------------
+    @router.post("/clients/create")
+    async def client_create(request: Request):
+        """@brief 注册应用(返回一次性明文密钥)"""
+        user, error = _require_admin(request)
+        if error:
+            return error
+        form = await read_form(request)
+        error = _check_csrf(request, form.get("csrf_token", ""))
+        if error:
+            return error
+        client_id = form.get("client_id", "")
+        secret = ctx.oidc.create_client(
+            client_id, form.get("name", ""), [form.get("redirect_uri", "")],
+            backchannel_url=form.get("backchannel_url") or None)
+        ctx.audit.append(user["account"], events.SETTINGS_CHANGED,
+                         {"key": "client_created", "client_id": client_id}, "0.0.0.0")
+        return {"client_id": client_id, "client_secret_once": secret}
+    # ---- 审计区(近 N 条 + 一键校验,02-A4) ------------------------------
+    @router.get("/audit")
+    def audit_view(request: Request, limit: int = 50):
+        """@brief 审计日志查看(近 N 条,分页参数钳制)"""
+        _, error = _require_admin(request)
+        if error:
+            return error
+        limit = max(1, min(int(limit), 500))
+        rows = ctx.db.query(
+            "SELECT id, ts, actor, action, ip FROM audit_logs"
+            " ORDER BY id DESC LIMIT ?", (limit,))
+        return {"entries": [dict(zip(("id", "ts", "actor", "action", "ip"), row))
+                            for row in rows]}
+    @router.get("/audit/verify")
+    def audit_verify(request: Request):
+        """@brief 审计哈希链一键校验"""
+        _, error = _require_admin(request)
+        if error:
+            return error
+        try:
+            count = verify_chain(ctx.db)
+        except PlatformError as exc:
+            return JSONResponse({"chain": "BROKEN", "error": str(exc)},
+                                status_code=500)
+        return {"chain": "OK", "records": count}
+    # ---- 模式区(H05 §3) --------------------------------------------------
+    @router.get("/mode")
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 30/62 页 ——
+    def mode_view(request: Request):
+        """@brief 当前运行模式与来源层"""
+        _, error = _require_admin(request)
+        if error:
+            return error
+        value, source = ctx.settings.get_with_source("demo_mode")
+        return {"mode": ctx.profile.mode, "demo_mode_source": source,
+                "env_locked": source == "env"}
+    @router.post("/mode/switch")
+    async def mode_switch(request: Request):
+        """@brief 模式热切换(生产→DEMO 需二次确认+原因)"""
+        user, error = _require_admin(request)
+        if error:
+            return error
+        form = await read_form(request)
+        error = _check_csrf(request, form.get("csrf_token", ""))
+        if error:
+            return error
+        target = form.get("target", "")
+        try:
+            if target == "prod":
+                return mode_service.switch_to_prod(user["account"], "0.0.0.0")
+            if target == "demo":
+                return mode_service.switch_to_demo(
+                    user["account"], "0.0.0.0", form_bool(form, "confirm"),
+                    form.get("reason", ""))
+        except PlatformError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse({"error": "target 必须为 demo|prod"}, status_code=400)
+    return router
+===== packages/gd_sso_client/__init__.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    __init__.py
+@brief   gd_sso_client:RP 侧统一 OIDC 接入库接口定义(H08 §3 契约)。
+         全平台一份库,消灭遗留 4 份拷贝。本里程碑仅落接口(H01 ai_directives:
+         "可先空实现"),实现见 client.py(里程碑 2 已交付)。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import dataclasses
+from typing import Optional, Protocol
+# 必填 env(缺任一则 SSO 不启用、系统按原样运行,H08 §3)
+REQUIRED_ENV_KEYS = ("SSO_ISSUER", "SSO_CLIENT_ID", "SSO_CLIENT_SECRET", "SSO_REDIRECT")
+# RP 侧五路由(契约固定,H08 §3)
+RP_ROUTES = ("/sso/status", "/sso/login", "/sso/callback", "/sso/logout",
+             "/backchannel-logout")
+DEFAULT_SSO_SCOPES = "openid profile"
+DEFAULT_SESSION_TTL_SECONDS = 28800
+
+
+…………(中间页略,软著要求仅前后各 30 页)…………
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 33/62 页 ——
+        if status == 200:
+            return json.loads(body)
+        return {"authorization_endpoint": self._config.issuer + "/authorize",
+                "token_endpoint": self._config.issuer + "/token",
+                "jwks_uri": self._config.issuer + "/jwks.json"}
+    def _jwks(self) -> dict:
+        """@brief 获取并缓存 JWKS(只读缓存,ARC-7 允许)"""
+        if self._jwks_cache is None:
+            status, _, body = self._transport("GET", self._endpoints()["jwks_uri"],
+                                              None, None)
+            if status != 200:
+                raise CryptoError("获取 JWKS 失败")
+            self._jwks_cache = json.loads(body)
+        return self._jwks_cache
+    # ---- 契约五路由语义 ----------------------------------------------------
+    @property
+    def config(self) -> SsoConfig:
+        """@brief 只读配置(RP 装配层取 cookie/secure 选项)"""
+        return self._config
+    def status(self) -> dict:
+        """@brief /sso/status:登录页据此显隐按钮"""
+        return {"enabled": self._config.is_enabled}
+    def build_login_redirect(self, next_path: str) -> str:
+        """@brief 生成授权跳转 URL(state/nonce/PKCE 入易失态)"""
+        if not self._config.is_enabled:
+            raise PolicyValidationError("SSO 未启用(必填 env 不全)")
+        state, nonce = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
+        verifier, challenge = _pkce_pair()
+        safe_next = next_path if _is_safe_next(next_path) else DEFAULT_PORTAL_PATH
+        self._store.set(make_key(self._system, "state", state),
+                        json.dumps({"nonce": nonce, "verifier": verifier,
+                                    "next": safe_next}),
+                        ttl_seconds=STATE_TTL_SECONDS)
+        params = urllib.parse.urlencode({
+            "response_type": "code", "client_id": self._config.client_id,
+            "redirect_uri": self._config.redirect_uri, "scope": self._config.scopes,
+            "state": state, "nonce": nonce, "code_challenge": challenge,
+            "code_challenge_method": "S256"})
+        return f"{self._endpoints()['authorization_endpoint']}?{params}"
+    def handle_callback(self, query: dict) -> dict:
+        """
+        @brief  回调:state 一次性取出→换令牌→验签→建本地会话
+        @return {claims, session_id, next}
+        """
+        state_key = make_key(self._system, "state", query.get("state", ""))
+        raw = self._store.get(state_key)
+        self._store.delete(state_key)              # 先删后用:state 严格一次性
+        if raw is None:
+            raise PolicyValidationError("state 无效或已使用(疑似 CSRF/重放)")
+        state_record = json.loads(raw)
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 34/62 页 ——
+        body = urllib.parse.urlencode({
+            "grant_type": "authorization_code", "code": query.get("code", ""),
+            "redirect_uri": self._config.redirect_uri,
+            "client_id": self._config.client_id,
+            "client_secret": self._config.client_secret,
+            "code_verifier": state_record["verifier"]}).encode("ascii")
+        status, _, resp = self._transport(
+            "POST", self._endpoints()["token_endpoint"],
+            {"content-type": "application/x-www-form-urlencoded"}, body)
+        if status != 200:
+            raise CryptoError(f"令牌交换失败(HTTP {status})")
+        token_set = json.loads(resp)
+        claims = verify_jwt(token_set["id_token"], self._jwks(),
+                            issuer=self._config.issuer,
+                            audience=self._config.client_id,
+                            nonce=state_record["nonce"])
+        session_id = self._create_session(claims)
+        return {"claims": claims, "session_id": session_id,
+                "next": state_record["next"]}
+    def _create_session(self, claims: dict) -> str:
+        """@brief 建 RP 本地会话并维护 sub→sid 索引(back-channel 吊销依据)"""
+        session_id = secrets.token_urlsafe(32)
+        ttl = self._config.session_ttl_seconds
+        self._store.set(make_key(self._system, RP_SESSION_PREFIX, session_id),
+                        json.dumps({"sub": claims["sub"],
+                                    "groups": claims.get("groups", []),
+                                    "created": time.time()}), ttl_seconds=ttl)
+        index_key = make_key(self._system, RP_SUB_INDEX_PREFIX, claims["sub"])
+        raw = self._store.get(index_key)
+        sids = json.loads(raw) if raw else []
+        sids.append(session_id)
+        self._store.set(index_key, json.dumps(sids), ttl_seconds=ttl)
+        return session_id
+    def get_session(self, session_id: str) -> dict:
+        """@brief 取 RP 本地会话(TTL 由存储层保证)"""
+        raw = self._store.get(make_key(self._system, RP_SESSION_PREFIX, session_id or ""))
+        return json.loads(raw) if raw else None
+    def revoke_session(self, session_id: str):
+        """@brief 注销单个 RP 本地会话(/sso/logout 与映射失败回滚用)"""
+        session = self.get_session(session_id)
+        self._store.delete(make_key(self._system, RP_SESSION_PREFIX, session_id))
+        if session:
+            index_key = make_key(self._system, RP_SUB_INDEX_PREFIX, session["sub"])
+            raw = self._store.get(index_key)
+            remaining = [sid for sid in (json.loads(raw) if raw else [])
+                         if sid != session_id]
+            if remaining:
+                self._store.set(index_key, json.dumps(remaining),
+                                self._config.session_ttl_seconds)
+            else:
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 35/62 页 ——
+                self._store.delete(index_key)
+    def post_logout_url(self) -> str:
+        """@brief 注销后跳转地址(SSO_POST_LOGOUT,默认站内首页)"""
+        target = self._config.post_logout or "/"
+        return target if _is_safe_next(target) or "://" in target else "/"
+    def handle_backchannel_logout(self, logout_token: str) -> str:
+        """@brief 验 logout_token 并即刻吊销该用户全部本地会话(H08 §3)"""
+        claims = verify_jwt(logout_token, self._jwks(),
+                            issuer=self._config.issuer,
+                            audience=self._config.client_id, nonce=None)
+        if "events" not in claims:
+            raise CryptoError("logout_token 缺少 events 声明")
+        sub = claims["sub"]
+        index_key = make_key(self._system, RP_SUB_INDEX_PREFIX, sub)
+        raw = self._store.get(index_key)
+        for session_id in (json.loads(raw) if raw else []):
+            self._store.delete(make_key(self._system, RP_SESSION_PREFIX, session_id))
+        self._store.delete(index_key)
+        return sub
+===== packages/gd_sso_client/jwt_verify.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    jwt_verify.py
+@brief   RP 侧 JWT 验签(RS256 / SM2SM3 双算法,按 JWKS kid 选钥选算法):
+         iss/aud/exp 强校验、±60s 时钟偏移容忍(06-E9)。gm 套件下 IdP 以
+         SM2-with-SM3 签发,RP 按 header.alg+kid 自动匹配(H04 §8.2.3)。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import base64
+import json
+import time
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from gd_common.errors import CryptoError
+JWT_CLOCK_SKEW_SECONDS = 60
+JWT_ALG_RS256 = "RS256"
+JWT_ALG_SM2SM3 = "SM2SM3"
+def _b64url_decode(segment: str) -> bytes:
+    """@brief 补齐填充的 base64url 解码"""
+    padded = segment + "=" * (-len(segment) % 4)
+    return base64.urlsafe_b64decode(padded)
+def _b64url_to_int(segment: str) -> int:
+    """@brief base64url → 大整数(JWK n/e)"""
+    return int.from_bytes(_b64url_decode(segment), "big")
+def _public_key_for_kid(jwks: dict, kid: str):
+    """@brief 从 JWKS 按 kid 构建 RSA 公钥"""
+    for jwk in jwks.get("keys", []):
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 36/62 页 ——
+        if jwk.get("kid") == kid and jwk.get("kty") == "RSA":
+            numbers = rsa.RSAPublicNumbers(_b64url_to_int(jwk["e"]),
+                                           _b64url_to_int(jwk["n"]))
+            return numbers.public_key()
+    raise CryptoError(f"JWKS 中不存在 kid={kid} 的 RSA 公钥")
+def _sm2_public_for_kid(jwks: dict, kid: str) -> tuple:
+    """@brief 从 JWKS 按 kid 取 SM2 公钥坐标并做曲线成员校验(防伪造点)"""
+    from gd_crypto.gm.sm2 import validate_public_key
+    for jwk in jwks.get("keys", []):
+        if jwk.get("kid") == kid and jwk.get("crv") == "SM2":
+            public = (_b64url_to_int(jwk["x"]), _b64url_to_int(jwk["y"]))
+            validate_public_key(public)
+            return public
+    raise CryptoError(f"JWKS 中不存在 kid={kid} 的 SM2 公钥")
+def verify_jwt(token: str, jwks: dict, issuer: str, audience: str,
+               nonce: str = None, now: float = None) -> dict:
+    """
+    @brief  验签并校验 iss/aud/exp(/nonce),返回声明
+    @param  token    JWT 字符串
+    @param  jwks     IdP 发布的 JWKS 文档
+    @param  issuer   期望 iss
+    @param  audience 期望 aud
+    @param  nonce    期望 nonce(id_token 传入;logout_token 传 None)
+    @return claims 字典
+    @raises CryptoError 任一校验失败
+    """
+    try:
+        header_seg, payload_seg, signature_seg = token.split(".")
+        header = json.loads(_b64url_decode(header_seg))
+        claims = json.loads(_b64url_decode(payload_seg))
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise CryptoError("JWT 格式非法") from exc
+    alg = header.get("alg")
+    signing_input = f"{header_seg}.{payload_seg}".encode("ascii")
+    if alg == JWT_ALG_RS256:
+        public_key = _public_key_for_kid(jwks, header.get("kid"))
+        try:
+            public_key.verify(_b64url_decode(signature_seg), signing_input,
+                              padding.PKCS1v15(), hashes.SHA256())
+        except InvalidSignature as exc:
+            raise CryptoError("JWT 签名校验失败") from exc
+    elif alg == JWT_ALG_SM2SM3:
+        from gd_crypto.gm.sm2 import verify as sm2_verify
+        sm2_public = _sm2_public_for_kid(jwks, header.get("kid"))
+        if not sm2_verify(signing_input, _b64url_decode(signature_seg), sm2_public):
+            raise CryptoError("JWT 签名校验失败")
+    else:
+        raise CryptoError(f"不支持的签名算法: {alg}")
+    moment = now if now is not None else time.time()
+    if claims.get("iss") != issuer:
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 37/62 页 ——
+        raise CryptoError("JWT iss 不匹配")
+    if claims.get("aud") != audience:
+        raise CryptoError("JWT aud 不匹配")
+    if "exp" in claims and moment > claims["exp"] + JWT_CLOCK_SKEW_SECONDS:
+        raise CryptoError("JWT 已过期")
+    if nonce is not None and claims.get("nonce") != nonce:
+        raise CryptoError("JWT nonce 不匹配(疑似重放)")
+    return claims
+===== packages/gd_crypto/__init__.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    __init__.py
+@brief   gd_crypto:密码学统一抽象共享库(H01 ARC-8)。业务代码只允许 import 本包,
+         MUST NOT 直呼具体算法库(代码评审发现即否决,H04 ai_directives)。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+from gd_crypto.chain import compute_record_hash, verify_record_hash
+from gd_crypto.context_token import issue_context, renew_context, verify_context
+from gd_crypto.envelope import (
+    decrypt_envelope,
+    encrypt_envelope,
+    envelope_from_json,
+    envelope_to_json,
+)
+from gd_crypto.keyring import MasterKeyRing
+from gd_crypto.password import hash_password, hmac_index, hmac_index_matches, verify_password
+from gd_crypto.suites import current_suite, get_suite, SUITE_GM, SUITE_INTL
+__all__ = [
+    "MasterKeyRing", "current_suite", "get_suite", "SUITE_INTL", "SUITE_GM",
+    "encrypt_envelope", "decrypt_envelope", "envelope_to_json", "envelope_from_json",
+    "hash_password", "verify_password", "hmac_index", "hmac_index_matches",
+    "issue_context", "verify_context", "renew_context",
+    "compute_record_hash", "verify_record_hash",
+]
+===== packages/gd_crypto/chain.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    chain.py
+@brief   审计链哈希纯函数(H12 §四):hash = H(id‖ts‖actor‖action‖detail‖ip‖prev_hash),
+         摘要算法随套件、逐条记录 alg,链校验按记录 alg 逐条选算法。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+from gd_crypto.suites import ICryptoSuite, suite_for_hash_alg
+CHAIN_FIELD_SEP = "\x1f"      # 单元分隔符:防止字段拼接歧义(如 "a"+"bc" 与 "ab"+"c")
+GENESIS_PREV_HASH = ""        # 创世记录的 prev_hash 约定为空串
+def compute_record_hash(record: dict, suite: ICryptoSuite) -> str:
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 38/62 页 ——
+    """
+    @brief  计算单条审计记录链哈希
+    @param  record 含 id/ts/actor/action/detail/ip/prev_hash 的字典
+    @param  suite  写入时的当前套件(alg 随记录落库)
+    @return 哈希 hex 串
+    """
+    material = CHAIN_FIELD_SEP.join([
+        str(record["id"]), str(record["ts"]), str(record["actor"]),
+        str(record["action"]), str(record["detail"]), str(record["ip"]),
+        str(record["prev_hash"]),
+    ])
+    return suite.digest(material.encode("utf-8")).hex()
+def verify_record_hash(record: dict) -> bool:
+    """
+    @brief  按记录自带 alg 选算法重算并比对(套件切换不破坏链完整性,H04 §8.2.4)
+    @param  record 含 alg 与 hash 字段的完整审计记录
+    @return 哈希是否一致
+    """
+    suite = suite_for_hash_alg(record["alg"])
+    return compute_record_hash(record, suite) == record["hash"]
+===== packages/gd_crypto/context_token.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    context_token.py
+@brief   无状态自包含登录上下文令牌(H02-A3 / H06-E2 红线):
+         载荷 base64url + 服务器持久密钥 HMAC 签名,重启/多实例可验签还原;
+         过期走"自动续签"语义而非报错死路。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import base64
+import hmac as _hmac_mod
+import json
+import time
+from gd_common.errors import ExpiredContextError, InvalidContextError
+from gd_crypto.suites import ICryptoSuite
+TOKEN_SEP = "."
+CLOCK_SKEW_SECONDS = 60      # 允许的时钟偏移(H06-E9:时钟漂移导致"登录即过期")
+DEFAULT_CONTEXT_TTL = 1800   # 登录上下文默认有效期 30 分钟(H02-A3)
+CLAIM_EXPIRES_AT = "exp"
+CLAIM_ISSUED_AT = "iat"
+def _b64url_encode(data: bytes) -> str:
+    """@brief base64url 无填充编码"""
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+def _b64url_decode(data: str) -> bytes:
+    """@brief base64url 解码(补齐填充),损坏抛 InvalidContextError"""
+    padding = "=" * (-len(data) % 4)
+    try:
+        return base64.urlsafe_b64decode(data + padding)
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 39/62 页 ——
+    except Exception as exc:
+        raise InvalidContextError("上下文令牌编码损坏") from exc
+def issue_context(payload: dict, key: bytes, suite: ICryptoSuite,
+                  ttl_seconds: int = DEFAULT_CONTEXT_TTL, now: float = None) -> str:
+    """
+    @brief  签发无状态上下文令牌:header.payload.sig 三段式,签名算法自描述
+    @param  payload     业务载荷(rid/pid 等,不得含口令或密钥)
+    @param  key         HMAC 状态密钥(持久化,多实例读同一份,H02-A3)
+    @param  suite       当前套件(签名算法随套件)
+    @param  ttl_seconds 有效期秒数
+    @param  now         当前时间戳(测试注入用)
+    @return 令牌字符串
+    """
+    issued_at = int(time.time() if now is None else now)
+    body = dict(payload)
+    body[CLAIM_ISSUED_AT] = issued_at
+    body[CLAIM_EXPIRES_AT] = issued_at + int(ttl_seconds)
+    header_b64 = _b64url_encode(json.dumps({"alg": suite.hmac_alg}).encode("utf-8"))
+    payload_b64 = _b64url_encode(
+        json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
+    signing_input = f"{header_b64}{TOKEN_SEP}{payload_b64}".encode("ascii")
+    sig_b64 = _b64url_encode(suite.hmac(key, signing_input))
+    return f"{header_b64}{TOKEN_SEP}{payload_b64}{TOKEN_SEP}{sig_b64}"
+def verify_context(token: str, key: bytes, suite: ICryptoSuite, now: float = None) -> dict:
+    """
+    @brief  验签并还原上下文载荷。签名不符 → InvalidContextError;
+            已过期 → ExpiredContextError(携带载荷,调用方 MUST 自动续签回登录页
+            而非报"登录超时"死路,H06-E2)
+    @param  token 令牌字符串
+    @param  key   HMAC 状态密钥
+    @param  suite 当前套件
+    @param  now   当前时间戳(测试注入用)
+    @return 载荷 dict
+    """
+    parts = token.split(TOKEN_SEP)
+    if len(parts) != 3:
+        raise InvalidContextError("上下文令牌结构非法")
+    header_b64, payload_b64, sig_b64 = parts
+    signing_input = f"{header_b64}{TOKEN_SEP}{payload_b64}".encode("ascii")
+    expected_sig = _b64url_encode(suite.hmac(key, signing_input))
+    if not _hmac_mod.compare_digest(expected_sig, sig_b64):
+        raise InvalidContextError("上下文令牌签名校验失败")
+    try:
+        payload = json.loads(_b64url_decode(payload_b64))
+    except (TypeError, ValueError) as exc:
+        raise InvalidContextError("上下文载荷反序列化失败") from exc
+    current = time.time() if now is None else now
+    if current > payload.get(CLAIM_EXPIRES_AT, 0) + CLOCK_SKEW_SECONDS:
+        raise ExpiredContextError(payload)
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 40/62 页 ——
+    return payload
+def renew_context(expired_payload: dict, key: bytes, suite: ICryptoSuite,
+                  ttl_seconds: int = DEFAULT_CONTEXT_TTL, now: float = None) -> str:
+    """
+    @brief  过期上下文自动续签:保留业务字段、刷新时间声明并重新签发
+    @param  expired_payload ExpiredContextError.payload
+    @return 新令牌字符串
+    """
+    body = {k: v for k, v in expired_payload.items()
+            if k not in (CLAIM_ISSUED_AT, CLAIM_EXPIRES_AT)}
+    return issue_context(body, key, suite, ttl_seconds, now)
+===== packages/gd_crypto/envelope.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    envelope.py
+@brief   密文信封:每对象独立 DEK + 主密钥包裹,自描述 JSON 统一格式(H12 §三)。
+         解密按对象自带 alg/kid 选算法——套件切换只影响新写入,存量永远可解(H04 §8.2.2)。
+         v2.0(13-R-IDP-2):支持双写窗口——CRYPTO_DUAL_WRITE=<副套件名> 生效期间,
+         新信封追加 dual 段(副套件完整平行密文),迁移期新旧套件均可解可验;
+         主段解密失败(如套件 Provider 不可用)时自动回退 dual 段。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import base64
+import json
+import os
+import secrets
+from gd_common.errors import CryptoError
+from gd_crypto.keyring import MasterKeyRing
+from gd_crypto.suites import GCM_NONCE_LEN, get_suite, ICryptoSuite, suite_for_aead_alg
+ENV_DUAL_WRITE = "CRYPTO_DUAL_WRITE"    # 双写窗口开关:值为副套件名(intl|gm)
+def resolve_dual_suite(primary: ICryptoSuite, environ: dict = None) -> ICryptoSuite:
+    """@brief 解析双写副套件:未开窗口或与主套件同名返回 None(13-R-IDP-2)"""
+    env = os.environ if environ is None else environ
+    name = env.get(ENV_DUAL_WRITE, "").strip()
+    if not name or name == primary.name:
+        return None
+    return get_suite(name)
+ENVELOPE_VERSION = 1     # 信封格式版本号
+DEK_LEN = 32             # 数据加密密钥长度(字节)
+DEK_ID_PREFIX = "dk"     # DEK 标识前缀
+DEK_ID_RAND_BYTES = 6    # DEK 标识随机部分字节数
+def _b64e(data: bytes) -> str:
+    """@brief base64 编码为字符串"""
+    return base64.b64encode(data).decode("ascii")
+def _b64d(data: str) -> bytes:
+    """@brief base64 解码,损坏即抛 CryptoError"""
+    try:
+        return base64.b64decode(data, validate=True)
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 41/62 页 ——
+    except Exception as exc:
+        raise CryptoError("信封字段 base64 解码失败") from exc
+def _seal_once(plaintext: bytes, ring: MasterKeyRing, suite: ICryptoSuite,
+               aad: bytes) -> dict:
+    """@brief 单套件信封构造(encrypt_envelope 主段与 dual 段共用)"""
+    dek = secrets.token_bytes(DEK_LEN)
+    dek_id = DEK_ID_PREFIX + secrets.token_hex(DEK_ID_RAND_BYTES)
+    data_nonce = os.urandom(GCM_NONCE_LEN)
+    ct, tag = suite.aead_encrypt(dek, data_nonce, plaintext, aad)
+    master_kid, master_key = ring.current()
+    wrap_nonce = os.urandom(GCM_NONCE_LEN)
+    wrapped_ct, wrapped_tag = suite.aead_encrypt(master_key, wrap_nonce, dek, b"")
+    return {
+        "v": ENVELOPE_VERSION,
+        "alg": suite.aead_alg,
+        "kid": dek_id,
+        "nonce": _b64e(data_nonce),
+        "ct": _b64e(ct),
+        "tag": _b64e(tag),
+        "wrapped_dek": {
+            "alg": suite.aead_alg,
+            "kid": master_kid,
+            "nonce": _b64e(wrap_nonce),
+            "ct": _b64e(wrapped_ct),
+            "tag": _b64e(wrapped_tag),
+        },
+    }
+def encrypt_envelope(plaintext: bytes, ring: MasterKeyRing, suite: ICryptoSuite,
+                     aad: bytes = b"", environ: dict = None) -> dict:
+    """
+    @brief  信封加密:随机 DEK 加密数据,当前主密钥包裹 DEK,产出自描述 JSON 信封;
+            双写窗口开启时(CRYPTO_DUAL_WRITE)追加副套件平行 dual 段(13-R-IDP-2)
+    @param  plaintext 明文字节串(调用方负责用后释放,不落明文临时文件,H04 §六)
+    @param  ring      主密钥环
+    @param  suite     当前写入套件(读取时按信封元数据选套件,与本参数无关)
+    @param  aad       附加认证数据(可选,绑定业务上下文)
+    @param  environ   环境字典(测试注入用),缺省取 os.environ
+    @return 信封 dict:{v, alg, kid, nonce, ct, tag, wrapped_dek{...}[, dual{...}]}
+    """
+    envelope = _seal_once(plaintext, ring, suite, aad)
+    dual_suite = resolve_dual_suite(suite, environ)
+    if dual_suite is not None:
+        envelope["dual"] = _seal_once(plaintext, ring, dual_suite, aad)
+    return envelope
+def decrypt_envelope(envelope: dict, ring: MasterKeyRing, aad: bytes = b"") -> bytes:
+    """
+    @brief  信封解密:按 wrapped_dek.kid 选主密钥解包 DEK,再按信封 alg 解数据。
+            密文/标签按位翻转 MUST 解密失败(GCM 完整性,H09 §二 A.5)。
+            主段解密抛错且存在 dual 段时,回退副套件段再试一次(13-R-IDP-2)。
+    @param  envelope 信封 dict(可来自 JSON 反序列化)
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 42/62 页 ——
+    @param  ring     主密钥环
+    @param  aad      附加认证数据,须与加密时一致
+    @return 明文字节串
+    """
+    if not isinstance(envelope, dict) or envelope.get("v") != ENVELOPE_VERSION:
+        raise CryptoError("信封格式非法或版本不受支持")
+    try:
+        return _open_once(envelope, ring, aad)
+    except CryptoError:
+        dual = envelope.get("dual")
+        if isinstance(dual, dict):
+            return _open_once(dual, ring, aad)
+        raise
+def _open_once(envelope: dict, ring: MasterKeyRing, aad: bytes) -> bytes:
+    """@brief 单段信封解密(decrypt_envelope 主段与 dual 段共用)"""
+    wrapped = envelope.get("wrapped_dek") or {}
+    wrap_suite = suite_for_aead_alg(wrapped.get("alg", ""))
+    master_key = ring.get(wrapped.get("kid", ""))
+    dek = wrap_suite.aead_decrypt(
+        master_key, _b64d(wrapped["nonce"]), _b64d(wrapped["ct"]), _b64d(wrapped["tag"]), b""
+    )
+    data_suite = suite_for_aead_alg(envelope.get("alg", ""))
+    return data_suite.aead_decrypt(
+        dek, _b64d(envelope["nonce"]), _b64d(envelope["ct"]), _b64d(envelope["tag"]), aad
+    )
+def envelope_to_json(envelope: dict) -> str:
+    """@brief 信封序列化为紧凑 JSON(入库统一格式:PG=JSONB / SQLite=TEXT)"""
+    return json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+def envelope_from_json(raw: str) -> dict:
+    """@brief 从 JSON 字符串还原信封,损坏即抛 CryptoError"""
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise CryptoError("信封 JSON 反序列化失败") from exc
+===== packages/gd_crypto/gm/__init__.py =====
+===== packages/gd_crypto/gm/gcm.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    gcm.py
+@brief   GCM 认证加密模式纯 Python 实现(NIST SP 800-38D):CTR 加密 + GHASH 认证。
+         分组密码内核以函数注入(SM4 生产使用;AES 内核仅测试对拍,与 cryptography
+         库输出比对锚定模式层正确性)。GHASH 采用标准逐位 GF(2^128) 乘法(实现
+         简洁可审计;冒烟/迁移数据量级下性能足够)。
+@author  港电实验室平台组
+@date    2026-07-20
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import hmac as _hmac_mod
+import struct
+from typing import Callable
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 43/62 页 ——
+from gd_common.errors import CryptoError
+GCM_BLOCK = 16                    # GCM 分组长度(字节)
+GCM_TAG_LEN = 16                  # 认证标签长度(字节)
+_R_POLY = 0xE1000000000000000000000000000000  # GF(2^128) 既约多项式常数(反射表示)
+BlockEncryptor = Callable[[bytes], bytes]     # 单块加密内核签名:16B → 16B
+def _gf_mult(x: int, y: int) -> int:
+    """@brief GF(2^128) 乘法(SP 800-38D §6.3 反射表示逐位算法)"""
+    z, v = 0, x
+    for i in range(127, -1, -1):
+        if (y >> i) & 1:
+            z ^= v
+        v = (v >> 1) ^ (_R_POLY if v & 1 else 0)
+    return z
+def _ghash(h: int, data: bytes) -> int:
+    """@brief GHASH 累积:Y_i = (Y_{i-1} ⊕ X_i)·H,数据非整块末尾补零"""
+    y = 0
+    for offset in range(0, len(data), GCM_BLOCK):
+        block = data[offset:offset + GCM_BLOCK].ljust(GCM_BLOCK, b"\x00")
+        y = _gf_mult(y ^ int.from_bytes(block, "big"), h)
+    return y
+def _ctr_stream(encrypt: BlockEncryptor, j0: bytes, length: int) -> bytes:
+    """@brief 生成 CTR 密钥流(计数器从 j0+1 起,SP 800-38D §7.1)"""
+    counter = int.from_bytes(j0[12:], "big")
+    prefix = j0[:12]
+    stream = bytearray()
+    for _ in range((length + GCM_BLOCK - 1) // GCM_BLOCK):
+        counter = (counter + 1) & 0xFFFFFFFF
+        stream += encrypt(prefix + struct.pack(">I", counter))
+    return bytes(stream[:length])
+def _compute_tag(encrypt: BlockEncryptor, h: int, j0: bytes,
+                 aad: bytes, ciphertext: bytes) -> bytes:
+    """@brief 计算认证标签:GHASH(AAD‖CT‖长度块) ⊕ E(J0)"""
+    aad_pad = aad + b"\x00" * ((-len(aad)) % GCM_BLOCK)
+    ct_pad = ciphertext + b"\x00" * ((-len(ciphertext)) % GCM_BLOCK)
+    lengths = struct.pack(">QQ", len(aad) * 8, len(ciphertext) * 8)
+    s = _ghash(h, aad_pad + ct_pad + lengths)
+    e_j0 = int.from_bytes(encrypt(j0), "big")
+    return (s ^ e_j0).to_bytes(GCM_BLOCK, "big")[:GCM_TAG_LEN]
+def _derive_j0(encrypt: BlockEncryptor, h: int, nonce: bytes) -> bytes:
+    """@brief 由 nonce 派生初始计数块 J0(96bit 快路径 / 任意长 GHASH 路径)"""
+    if len(nonce) == 12:
+        return nonce + b"\x00\x00\x00\x01"
+    nonce_pad = nonce + b"\x00" * ((-len(nonce)) % GCM_BLOCK)
+    material = nonce_pad + struct.pack(">QQ", 0, len(nonce) * 8)
+    return _ghash(h, material).to_bytes(GCM_BLOCK, "big")
+def gcm_encrypt(encrypt: BlockEncryptor, nonce: bytes, plaintext: bytes,
+                aad: bytes) -> tuple:
+    """
+    @brief  GCM 加密
+    @param  encrypt 单块加密内核(SM4 生产 / AES 对拍)
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 44/62 页 ——
+    @param  nonce   随机数(常规 12 字节)
+    @param  plaintext 明文
+    @param  aad     附加认证数据
+    @return (密文, 16 字节标签)
+    """
+    h = int.from_bytes(encrypt(b"\x00" * GCM_BLOCK), "big")
+    j0 = _derive_j0(encrypt, h, nonce)
+    ciphertext = bytes(p ^ s for p, s in
+                       zip(plaintext, _ctr_stream(encrypt, j0, len(plaintext))))
+    return ciphertext, _compute_tag(encrypt, h, j0, aad, ciphertext)
+def gcm_decrypt(encrypt: BlockEncryptor, nonce: bytes, ciphertext: bytes,
+                tag: bytes, aad: bytes) -> bytes:
+    """
+    @brief  GCM 解密:先常数时间验标签,失败抛 CryptoError(H12 §三.4 完整性)
+    @return 明文
+    """
+    h = int.from_bytes(encrypt(b"\x00" * GCM_BLOCK), "big")
+    j0 = _derive_j0(encrypt, h, nonce)
+    expected = _compute_tag(encrypt, h, j0, aad, ciphertext)
+    if not _hmac_mod.compare_digest(expected, tag):
+        raise CryptoError("AEAD 解密失败:密文或标签校验不通过")
+    return bytes(c ^ s for c, s in
+                 zip(ciphertext, _ctr_stream(encrypt, j0, len(ciphertext))))
+===== packages/gd_crypto/gm/sm2.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    sm2.py
+@brief   SM2 数字签名纯 Python 参考实现(GB/T 32918.2-2016,曲线 sm2p256v1):
+         签名/验签 + ZA 用户杂凑(默认 ID)。用于 gm 套件下 OIDC id_token 的
+         SM2-with-SM3 签名(H04 §8.1)。仿射坐标 + 费马小定理求逆,
+         点运算正确性由"曲线方程 + 签验回环 + 篡改拒绝"测试锚定。
+@author  港电实验室平台组
+@date    2026-07-20
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import secrets
+import struct
+from gd_common.errors import CryptoError
+from gd_crypto.gm.sm3 import sm3_digest
+# 曲线 sm2p256v1 参数(GB/T 32918.5 附录 A)
+P = 0xFFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000FFFFFFFFFFFFFFFF
+A = 0xFFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000FFFFFFFFFFFFFFFC
+B = 0x28E9FA9E9D9F5E344D5A9E4BCF6509A7F39789F515AB8F92DDBCBD414D940E93
+N = 0xFFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFF7203DF6B21C6052B53BBF40939D54123
+GX = 0x32C4AE2C1F1981195F9904466A39C9948FE30BBFF2660BE1715A4589334C74C7
+GY = 0xBC3736A2F4F6779C59BDCEE36B692153D0A9877CC62A474002DF32E52139F0A0
+COORD_LEN = 32                          # 坐标/标量字节长
+SIGNATURE_LEN = 64                      # 签名 r‖s 原始拼接长度
+DEFAULT_USER_ID = b"1234567812345678"   # GB/T 32918 缺省用户身份标识
+def _inv_mod(value: int, modulus: int) -> int:
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 45/62 页 ——
+    """@brief 模逆(费马小定理;modulus 为素数)"""
+    return pow(value, modulus - 2, modulus)
+def _point_add(p1: tuple, p2: tuple) -> tuple:
+    """@brief 仿射坐标点加(含倍点分支);None 表示无穷远点"""
+    if p1 is None:
+        return p2
+    if p2 is None:
+        return p1
+    x1, y1 = p1
+    x2, y2 = p2
+    if x1 == x2:
+        if (y1 + y2) % P == 0:
+            return None
+        slope = (3 * x1 * x1 + A) * _inv_mod(2 * y1, P) % P
+    else:
+        slope = (y2 - y1) * _inv_mod(x2 - x1, P) % P
+    x3 = (slope * slope - x1 - x2) % P
+    return x3, (slope * (x1 - x3) - y1) % P
+def _scalar_mult(scalar: int, point: tuple) -> tuple:
+    """@brief 标量乘(二进制自左向右)"""
+    result = None
+    addend = point
+    while scalar:
+        if scalar & 1:
+            result = _point_add(result, addend)
+        addend = _point_add(addend, addend)
+        scalar >>= 1
+    return result
+def generate_keypair() -> tuple:
+    """@brief 生成 SM2 密钥对 @return (私钥 int, 公钥 (x, y))"""
+    private = secrets.randbelow(N - 2) + 1
+    return private, _scalar_mult(private, (GX, GY))
+def public_key_from_private(private: int) -> tuple:
+    """@brief 由私钥派生公钥 @return (x, y)"""
+    return _scalar_mult(private, (GX, GY))
+def _za(public: tuple, user_id: bytes) -> bytes:
+    """@brief 用户杂凑值 ZA = SM3(ENTL‖ID‖a‖b‖Gx‖Gy‖Px‖Py)(GB/T 32918.2 §5.5)"""
+    entl = struct.pack(">H", len(user_id) * 8)
+    material = entl + user_id
+    for value in (A, B, GX, GY, public[0], public[1]):
+        material += value.to_bytes(COORD_LEN, "big")
+    return sm3_digest(material)
+def _message_digest(message: bytes, public: tuple, user_id: bytes) -> int:
+    """@brief e = SM3(ZA‖M) 转整数"""
+    return int.from_bytes(sm3_digest(_za(public, user_id) + message), "big")
+def sign(message: bytes, private: int, user_id: bytes = DEFAULT_USER_ID) -> bytes:
+    """
+    @brief  SM2 签名(GB/T 32918.2 §6.1)
+    @param  message 待签消息
+    @param  private 私钥
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 46/62 页 ——
+    @param  user_id 用户身份标识(缺省标准 ID)
+    @return 64 字节原始签名 r‖s
+    """
+    public = public_key_from_private(private)
+    e = _message_digest(message, public, user_id)
+    while True:
+        k = secrets.randbelow(N - 1) + 1
+        x1, _ = _scalar_mult(k, (GX, GY))
+        r = (e + x1) % N
+        if r == 0 or r + k == N:
+            continue
+        s = _inv_mod(1 + private, N) * (k - r * private) % N
+        if s == 0:
+            continue
+        return r.to_bytes(COORD_LEN, "big") + s.to_bytes(COORD_LEN, "big")
+def verify(message: bytes, signature: bytes, public: tuple,
+           user_id: bytes = DEFAULT_USER_ID) -> bool:
+    """
+    @brief  SM2 验签(GB/T 32918.2 §7.1)
+    @param  signature 64 字节 r‖s
+    @param  public    公钥 (x, y)
+    @return 是否验签通过
+    """
+    if len(signature) != SIGNATURE_LEN:
+        return False
+    r = int.from_bytes(signature[:COORD_LEN], "big")
+    s = int.from_bytes(signature[COORD_LEN:], "big")
+    if not (1 <= r <= N - 1 and 1 <= s <= N - 1):
+        return False
+    t = (r + s) % N
+    if t == 0:
+        return False
+    e = _message_digest(message, public, user_id)
+    point = _point_add(_scalar_mult(s, (GX, GY)), _scalar_mult(t, public))
+    if point is None:
+        return False
+    return (e + point[0]) % N == r
+def validate_public_key(public: tuple) -> None:
+    """@brief 校验公钥在曲线上(JWKS 装载入口防伪造点,H04 §8.2.3)"""
+    x, y = public
+    if not (0 < x < P and 0 < y < P):
+        raise CryptoError("SM2 公钥坐标越界")
+    if (y * y - (x * x * x + A * x + B)) % P != 0:
+        raise CryptoError("SM2 公钥不在曲线上")
+===== packages/gd_crypto/gm/sm3.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    sm3.py
+@brief   SM3 摘要算法纯 Python 参考实现(GB/T 32905-2016),附 HMAC-SM3 与
+         PBKDF2-HMAC-SM3(H04 §8.1 gm 套件原语)。零第三方依赖(H01 ARC-5
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 47/62 页 ——
+         供应链最小面),正确性由 tests/test_f_crypto_suite.py 标准向量锚定。
+@author  港电实验室平台组
+@date    2026-07-20
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import struct
+_MASK32 = 0xFFFFFFFF
+# GB/T 32905 §4.1 初始值 IV
+_IV = (0x7380166F, 0x4914B2B9, 0x172442D7, 0xDA8A0600,
+       0xA96F30BC, 0x163138AA, 0xE38DEE4D, 0xB0FB0E4E)
+_T_LOW = 0x79CC4519      # 常量 Tj(0 ≤ j ≤ 15)
+_T_HIGH = 0x7A879D8A     # 常量 Tj(16 ≤ j ≤ 63)
+SM3_BLOCK_SIZE = 64      # 分组长度(字节),HMAC 分组同此
+SM3_DIGEST_SIZE = 32     # 摘要长度(字节)
+def _rotl(value: int, bits: int) -> int:
+    """@brief 32 位循环左移"""
+    bits %= 32
+    return ((value << bits) | (value >> (32 - bits))) & _MASK32
+def _p0(value: int) -> int:
+    """@brief 置换函数 P0(压缩用)"""
+    return value ^ _rotl(value, 9) ^ _rotl(value, 17)
+def _p1(value: int) -> int:
+    """@brief 置换函数 P1(消息扩展用)"""
+    return value ^ _rotl(value, 15) ^ _rotl(value, 23)
+def _expand(block: bytes) -> tuple:
+    """@brief 消息扩展:512bit 分组 → W[0..67] 与 W'[0..63]"""
+    w = list(struct.unpack(">16I", block))
+    for j in range(16, 68):
+        w.append(_p1(w[j - 16] ^ w[j - 9] ^ _rotl(w[j - 3], 15))
+                 ^ _rotl(w[j - 13], 7) ^ w[j - 6])
+    w_prime = [w[j] ^ w[j + 4] for j in range(64)]
+    return w, w_prime
+def _compress(state: tuple, block: bytes) -> tuple:
+    """@brief 压缩函数 CF:一个 512bit 分组更新链接变量(GB/T 32905 §4.3)"""
+    w, w_prime = _expand(block)
+    a, b, c, d, e, f, g, h = state
+    for j in range(64):
+        t_j = _T_LOW if j < 16 else _T_HIGH
+        ss1 = _rotl((_rotl(a, 12) + e + _rotl(t_j, j)) & _MASK32, 7)
+        ss2 = ss1 ^ _rotl(a, 12)
+        if j < 16:
+            ff = a ^ b ^ c
+            gg = e ^ f ^ g
+        else:
+            ff = (a & b) | (a & c) | (b & c)
+            gg = (e & f) | ((~e & _MASK32) & g)
+        tt1 = (ff + d + ss2 + w_prime[j]) & _MASK32
+        tt2 = (gg + h + ss1 + w[j]) & _MASK32
+        d, c, b, a = c, _rotl(b, 9), a, tt1
+        h, g, f, e = g, _rotl(f, 19), e, _p0(tt2)
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 48/62 页 ——
+    return tuple(x ^ y for x, y in zip(state, (a, b, c, d, e, f, g, h)))
+def sm3_digest(message: bytes) -> bytes:
+    """
+    @brief  计算 SM3 摘要(一次性接口;流式需求出现前不引入,H07 最小实现)
+    @param  message 输入字节串
+    @return 32 字节摘要
+    """
+    length_bits = len(message) * 8
+    # 填充:0x80 + 0x00* + 64bit 大端消息长度(与 SHA-256 同构)
+    padded = message + b"\x80"
+    padded += b"\x00" * ((SM3_BLOCK_SIZE - 8 - len(padded) % SM3_BLOCK_SIZE)
+                         % SM3_BLOCK_SIZE)
+    padded += struct.pack(">Q", length_bits)
+    state = _IV
+    for offset in range(0, len(padded), SM3_BLOCK_SIZE):
+        state = _compress(state, padded[offset:offset + SM3_BLOCK_SIZE])
+    return struct.pack(">8I", *state)
+def hmac_sm3(key: bytes, message: bytes) -> bytes:
+    """@brief HMAC-SM3(RFC 2104 结构,B=64) @return 32 字节 MAC"""
+    if len(key) > SM3_BLOCK_SIZE:
+        key = sm3_digest(key)
+    key = key.ljust(SM3_BLOCK_SIZE, b"\x00")
+    inner = bytes(k ^ 0x36 for k in key)
+    outer = bytes(k ^ 0x5C for k in key)
+    return sm3_digest(outer + sm3_digest(inner + message))
+def pbkdf2_hmac_sm3(password: bytes, salt: bytes, iterations: int,
+                    dklen: int = SM3_DIGEST_SIZE) -> bytes:
+    """
+    @brief  PBKDF2-HMAC-SM3 口令派生(RFC 8018 结构,PRF=HMAC-SM3,H04 §8.1)
+    @param  password 口令字节串
+    @param  salt     盐(MUST 随机,由调用方生成)
+    @param  iterations 迭代次数(下限由套件层守卫)
+    @param  dklen    派生密钥长度(字节)
+    @return 派生密钥
+    """
+    if len(password) > SM3_BLOCK_SIZE:
+        password = sm3_digest(password)
+    key = password.ljust(SM3_BLOCK_SIZE, b"\x00")
+    # 预压缩 ipad/opad 首块链接状态:内循环每次 HMAC 仅剩 2 次压缩(RFC 8018 惯用优化)
+    inner_state = _compress(_IV, bytes(k ^ 0x36 for k in key))
+    outer_state = _compress(_IV, bytes(k ^ 0x5C for k in key))
+    # 固定尾块布局:64B(已预压缩)+ 32B 数据 + 0x80 填充 + 96 字节总长(768 bit)
+    tail_suffix = b"\x80" + b"\x00" * 23 + struct.pack(">Q", (SM3_BLOCK_SIZE + SM3_DIGEST_SIZE) * 8)
+    def _hmac_fast(data32: bytes) -> bytes:
+        inner = _compress(inner_state, data32 + tail_suffix)
+        return struct.pack(">8I", *_compress(outer_state, struct.pack(">8I", *inner) + tail_suffix))
+    derived = b""
+    block_index = 1
+    while len(derived) < dklen:
+        u = hmac_sm3(password, salt + struct.pack(">I", block_index))
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 49/62 页 ——
+        t = int.from_bytes(u, "big")
+        for _ in range(iterations - 1):
+            u = _hmac_fast(u)
+            t ^= int.from_bytes(u, "big")
+        derived += t.to_bytes(SM3_DIGEST_SIZE, "big")
+        block_index += 1
+    return derived[:dklen]
+===== packages/gd_crypto/gm/sm4.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    sm4.py
+@brief   SM4 分组密码纯 Python 参考实现(GB/T 32907-2016):128bit 分组/密钥,
+         32 轮非平衡 Feistel。零第三方依赖(H01 ARC-5),正确性由标准向量锚定
+         (tests/test_f_crypto_suite.py)。仅供 gm 套件 GCM 模式调用。
+@author  港电实验室平台组
+@date    2026-07-20
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import struct
+_MASK32 = 0xFFFFFFFF
+SM4_BLOCK_SIZE = 16      # 分组长度(字节)
+SM4_KEY_SIZE = 16        # 密钥长度(字节)
+# GB/T 32907 §6.2 S 盒(256 字节查找表)
+_SBOX = bytes.fromhex(
+    "d690e9fecce13db716b614c228fb2c05"
+    "2b679a762abe04c3aa44132649860699"
+    "9c4250f491ef987a33540b43edcfac62"
+    "e4b31ca9c908e895 80df94fa758f3fa6"
+    "4707a7fcf3731 7ba83593c19e6854fa8"
+    "686b81b27164da8bf8eb0f4b70569d35"
+    "1e240e5e6358d1a225227c3b01217887"
+    "d40046579fd327524c3602e7a0c4c89e"
+    "eabf8ad240c738b5a3f7f2cef96115a1"
+    "e0ae5da49b341a55ad9332 30f58cb1e3"
+    "1df6e22e8266ca60c02923ab0d534e6f"
+    "d5db3745defd8e2f03ff6a726d6c5b51"
+    "8d1baf92bbddbc7f11d95c411f105ad8"
+    "0ac13188a5cd7bbd2d74d012b8e5b4b0"
+    "8969974a0c96777e65b9f109c56ec684"
+    "18f07dec3adc4d20 79ee5f3ed7cb3948".replace(" ", "")
+)
+# 系统参数 FK
+_FK = (0xA3B1BAC6, 0x56AA3350, 0x677D9197, 0xB27022DC)
+# 固定参数 CK:ck_{i,j} = (4i+j)×7 mod 256(按标准公式生成,免手抄 32 项表)
+_CK = tuple(
+    ((4 * i * 7 % 256) << 24) | (((4 * i + 1) * 7 % 256) << 16)
+    | (((4 * i + 2) * 7 % 256) << 8) | ((4 * i + 3) * 7 % 256)
+    for i in range(32)
+)
+def _rotl(value: int, bits: int) -> int:
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 50/62 页 ——
+    """@brief 32 位循环左移"""
+    return ((value << bits) | (value >> (32 - bits))) & _MASK32
+def _tau(word: int) -> int:
+    """@brief 非线性变换 τ:逐字节过 S 盒"""
+    return ((_SBOX[(word >> 24) & 0xFF] << 24) | (_SBOX[(word >> 16) & 0xFF] << 16)
+            | (_SBOX[(word >> 8) & 0xFF] << 8) | _SBOX[word & 0xFF])
+def _t_enc(word: int) -> int:
+    """@brief 合成置换 T(轮函数用):L(τ(x)),L = x⊕rotl2⊕rotl10⊕rotl18⊕rotl24"""
+    b = _tau(word)
+    return b ^ _rotl(b, 2) ^ _rotl(b, 10) ^ _rotl(b, 18) ^ _rotl(b, 24)
+def _t_key(word: int) -> int:
+    """@brief 合成置换 T'(密钥扩展用):L'(τ(x)),L' = x⊕rotl13⊕rotl23"""
+    b = _tau(word)
+    return b ^ _rotl(b, 13) ^ _rotl(b, 23)
+def expand_key(key: bytes) -> tuple:
+    """
+    @brief  密钥扩展:16 字节主密钥 → 32 个轮密钥(GB/T 32907 §7.3)
+    @param  key 128bit 主密钥
+    @return 轮密钥元组 rk[0..31](加密顺序;解密逆序使用)
+    """
+    if len(key) != SM4_KEY_SIZE:
+        raise ValueError("SM4 密钥长度必须为 16 字节")
+    k = list(struct.unpack(">4I", key))
+    k = [k[i] ^ _FK[i] for i in range(4)]
+    round_keys = []
+    for i in range(32):
+        rk = k[0] ^ _t_key(k[1] ^ k[2] ^ k[3] ^ _CK[i])
+        round_keys.append(rk)
+        k = [k[1], k[2], k[3], rk]
+    return tuple(round_keys)
+def encrypt_block(round_keys: tuple, block: bytes) -> bytes:
+    """@brief 单块加密(16 字节),GCM-CTR 仅需正向 @return 密文块"""
+    x = list(struct.unpack(">4I", block))
+    for i in range(32):
+        x = [x[1], x[2], x[3],
+             x[0] ^ _t_enc(x[1] ^ x[2] ^ x[3] ^ round_keys[i])]
+    return struct.pack(">4I", x[3], x[2], x[1], x[0])
+===== packages/gd_crypto/keyring.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    keyring.py
+@brief   主密钥环:kid → 主密钥映射,支撑信封解包按 kid 选钥与"轮换=迁移"
+         (H04 §五 / H06-E10 / H06-P0-1)。生产环境主密钥经 env 注入,未来迁 KMS。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import os
+from gd_common.errors import ConfigError, MasterKeyMismatchError
+MASTER_KEY_HEX_LEN = 64          # 32 字节主密钥的 hex 长度(H06-D5:非 64 位 hex 是常见 502 根因)
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 51/62 页 ——
+ENV_MASTER_KEY_HEX = "MASTER_KEY_HEX"
+ENV_MASTER_KEY_ID = "MASTER_KEY_ID"
+ENV_OLD_MASTER_KEY_HEX = "OLD_MASTER_KEY_HEX"    # 轮换迁移期旧钥(仅迁移脚本使用)
+ENV_OLD_MASTER_KEY_ID = "OLD_MASTER_KEY_ID"
+DEFAULT_MASTER_KEY_ID = "mk1"
+DEFAULT_OLD_MASTER_KEY_ID = "mk0"
+# 演示派生默认主密钥(仅 DEMO 单机联调;进入生产前置校验会与本常量比对并阻止,H05 §3.2.5)
+DEMO_MASTER_KEY_HEX = "00" * 32
+def _parse_key_hex(raw: str, source: str) -> bytes:
+    """
+    @brief  解析并校验 hex 主密钥格式
+    @param  raw    hex 字符串
+    @param  source 来源描述(报错定位用)
+    @return 32 字节密钥
+    """
+    value = raw.strip().strip('"').strip("'")   # 值带引号/空格是常见部署事故(H06-D5)
+    if len(value) != MASTER_KEY_HEX_LEN:
+        raise ConfigError(f"{source} 必须为 {MASTER_KEY_HEX_LEN} 位 hex(当前 {len(value)} 位)")
+    try:
+        return bytes.fromhex(value)
+    except ValueError as exc:
+        raise ConfigError(f"{source} 含非法 hex 字符") from exc
+class MasterKeyRing:
+    """主密钥环:持有一个当前钥与可选旧钥,按 kid 取钥,未知 kid 抛 E10 指引。"""
+    def __init__(self, keys: dict, current_kid: str):
+        if current_kid not in keys:
+            raise ConfigError(f"当前主密钥 kid={current_kid} 不在密钥环中")
+        self._keys = dict(keys)
+        self.current_kid = current_kid
+    @classmethod
+    def from_env(cls, environ: dict = None) -> "MasterKeyRing":
+        """
+        @brief  从环境变量装载密钥环(生产标准途径;测试可注入 environ)
+        @return MasterKeyRing 实例
+        """
+        env = os.environ if environ is None else environ
+        raw = env.get(ENV_MASTER_KEY_HEX)
+        if not raw:
+            raise ConfigError(
+                f"缺少 {ENV_MASTER_KEY_HEX}。请运行 scripts/gen_master_key.py 生成并注入环境变量;"
+                "任何真实密钥不得写入代码库或交付包(H00 G7)。"
+            )
+        current_kid = env.get(ENV_MASTER_KEY_ID, DEFAULT_MASTER_KEY_ID)
+        keys = {current_kid: _parse_key_hex(raw, ENV_MASTER_KEY_HEX)}
+        old_raw = env.get(ENV_OLD_MASTER_KEY_HEX)
+        if old_raw:
+            old_kid = env.get(ENV_OLD_MASTER_KEY_ID, DEFAULT_OLD_MASTER_KEY_ID)
+            keys[old_kid] = _parse_key_hex(old_raw, ENV_OLD_MASTER_KEY_HEX)
+        return cls(keys, current_kid)
+    def get(self, kid: str) -> bytes:
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 52/62 页 ——
+        """
+        @brief  按 kid 取主密钥;未知 kid 抛 MasterKeyMismatchError 并携带处置指引
+                (H06-E10:换根密钥≠改配置,必须走信封重包迁移)
+        @param  kid 密钥标识
+        @return 主密钥字节串
+        """
+        if kid not in self._keys:
+            raise MasterKeyMismatchError(kid)
+        return self._keys[kid]
+    def current(self) -> tuple:
+        """@brief 取当前钥 @return (kid, key)"""
+        return self.current_kid, self._keys[self.current_kid]
+    @property
+    def current_key(self) -> bytes:
+        """@brief 当前主密钥字节串(便捷只读属性)"""
+        return self._keys[self.current_kid]
+    def is_demo_key(self) -> bool:
+        """@brief 判断当前主密钥是否演示派生默认值(生产前置校验用,H05 §3.2.5)"""
+        return self._keys[self.current_kid] == bytes.fromhex(DEMO_MASTER_KEY_HEX)
+===== packages/gd_crypto/migrate.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    migrate.py
+@brief   密码套件迁移核心(H04 §8.2.6 / 13-R-IDP-2):逐对象"解旧包新",
+         幂等(alg 已达目标即跳过)、断点续迁(状态文件游标)、迁移开始/进度/
+         完成审计锚点。覆盖三类对象:DB 信封列(含 HMAC 索引重算)、文件形态
+         信封(证件/笔记图 blob)、口令哈希(只统计——登录透明重哈希,§8.2.5)。
+         CLI 壳见 scripts/migrate_crypto_suite.py(含强制备份守卫)。
+@author  港电实验室平台组
+@date    2026-07-20
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import json
+import os
+from gd_common.jsonlog import get_logger
+from gd_crypto.envelope import decrypt_envelope, encrypt_envelope, envelope_from_json, envelope_to_json
+from gd_crypto.keyring import MasterKeyRing
+from gd_crypto.password import hmac_index
+from gd_crypto.suites import ICryptoSuite
+_logger = get_logger("gd_crypto.migrate")
+# 声明式迁移目标:表 → (信封列清单, AAD 生成器输入列, AAD 模板)
+# AAD 语义与各业务写入点严格一致(变更此表 MUST 与写入点同步评审)
+DB_ENVELOPE_TARGETS = (
+    {"table": "idp_users", "id_col": "id", "columns": ("phone_ct", "totp_secret_ct"),
+     "aad": b"", "reindex": {"source": "phone_ct", "index_col": "phone_index"}},
+    {"table": "cv_users", "id_col": "id",
+     "columns": ("totp_secret_ct", "totp_pending_ct"), "aad": b"cv_totp_secret"},
+    {"table": "cv_notes", "id_col": "id", "columns": ("location_ct", "text_ct"),
+     "aad": b"cv_note"},
+    {"table": "nvr_devices", "id_col": "id", "columns": ("password_ct",),
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 53/62 页 ——
+     "aad": b"nvr_device_password"},
+    {"table": "nvr_api_keys", "id_col": "id", "columns": ("secret_ct",),
+     "aad": b"nvr_api_key"},
+    {"table": "f3d_external_keys", "id_col": "id", "columns": ("secret_ct",),
+     "aad": b"f3d-external"},
+)
+# 文件形态信封:表提供 blob_path 与 AAD 上下文
+FILE_ENVELOPE_TARGETS = (
+    {"table": "cv_certs", "id_col": "id", "path_col": "blob_path",
+     "aad_template": "cv_cert:{owner_id}", "aad_cols": ("owner_id",)},
+    {"table": "cv_note_images", "id_col": "id", "path_col": "blob_path",
+     "aad_template": "cv_note", "aad_cols": ()},
+)
+# 口令哈希列(只统计,不迁移:登录成功后透明重哈希,H04 §8.2.5)
+PASSWORD_TABLES = (("idp_users", "password_hash"), ("cv_users", "password_hash"),
+                   ("nvr_users", "password_hash"), ("f3d_users", "password_hash"))
+# 说明:quiz_users 无本地口令列(纯 SSO/游客双身份,H03 §6),不在统计范围
+PROGRESS_BATCH = 50        # 每处理 N 个对象写一条进度审计锚点
+MIGRATE_ACTOR = "migrate_crypto_suite"
+LOCAL_IP = "127.0.0.1"
+def _table_exists(db, table: str) -> bool:
+    """@brief 探测表是否存在(六库同构 schema,分库部署时缺表即跳过)"""
+    try:
+        db.query(f"SELECT 1 FROM {table} LIMIT 1")  # noqa: S608 表名出自本文件白名单
+        return True
+    except Exception:  # noqa: BLE001 方言差异统一按"不存在"处理
+        return False
+class MigrationState:
+    """断点状态文件:{target, done:[阶段键], cursor:{阶段键: last_id}, counts}。"""
+    def __init__(self, path: str, target: str):
+        self.path = path
+        self.data = {"target": target, "done": [], "cursor": {}, "counts": {}}
+        if path and os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as handle:
+                loaded = json.load(handle)
+            if loaded.get("target") == target:
+                self.data = loaded
+            else:
+                _logger.warning("状态文件目标套件不符,忽略旧状态重新开始",
+                                extra={"old": loaded.get("target"), "new": target})
+    def save(self):
+        """@brief 原子落盘(tmp+rename,断点一致性)"""
+        if not self.path:
+            return
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(self.data, handle, ensure_ascii=False)
+        os.replace(tmp, self.path)
+    def phase_done(self, key: str) -> bool:
+        """@brief 阶段是否已完成"""
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 54/62 页 ——
+        return key in self.data["done"]
+    def mark_done(self, key: str):
+        """@brief 标记阶段完成并落盘"""
+        if key not in self.data["done"]:
+            self.data["done"].append(key)
+        self.save()
+    def cursor(self, key: str) -> int:
+        """@brief 取阶段断点游标(未开始为 0)"""
+        return int(self.data["cursor"].get(key, 0))
+    def advance(self, key: str, last_id: int, migrated: int, skipped: int):
+        """@brief 推进游标并累计计数"""
+        self.data["cursor"][key] = last_id
+        counts = self.data["counts"].setdefault(key, {"migrated": 0, "skipped": 0})
+        counts["migrated"] += migrated
+        counts["skipped"] += skipped
+        self.save()
+def _reseal(raw_json: str, ring: MasterKeyRing, target: ICryptoSuite,
+            aad: bytes) -> str:
+    """@brief 单对象解旧包新;已达目标套件返回 None(幂等跳过)。
+    显式 environ={} 关闭双写——迁移产物统一为目标套件单段。
+    target=None 为主密钥轮换语义:算法不变,仅当前主密钥重包(H06-E10)。"""
+    envelope = envelope_from_json(raw_json)
+    if target is None:
+        wrapped_kid = (envelope.get("wrapped_dek") or {}).get("kid")
+        if wrapped_kid == ring.current_kid:
+            return None
+        from gd_crypto.suites import suite_for_aead_alg
+        target = suite_for_aead_alg(envelope.get("alg", ""))
+    elif envelope.get("alg") == target.aead_alg and "dual" not in envelope:
+        return None
+    plaintext = decrypt_envelope(envelope, ring, aad=aad)
+    return envelope_to_json(encrypt_envelope(plaintext, ring, target,
+                                             aad=aad, environ={}))
+def _migrate_db_target(db, ring, target, spec, state, audit) -> None:
+    """@brief 迁移单表的信封列(游标分批,批间可安全中断)"""
+    key = f"db:{spec['table']}"
+    if state.phase_done(key) or not _table_exists(db, spec["table"]):
+        state.mark_done(key)
+        return
+    columns = ", ".join(spec["columns"])
+    reindex = spec.get("reindex")
+    while True:
+        rows = db.query(
+            f"SELECT {spec['id_col']}, {columns} FROM {spec['table']}"  # noqa: S608
+            f" WHERE {spec['id_col']} > ? ORDER BY {spec['id_col']} LIMIT ?",
+            (state.cursor(key), PROGRESS_BATCH))
+        if not rows:
+            break
+        migrated = skipped = 0
+        for row in rows:
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 55/62 页 ——
+            row_id, values = row[0], row[1:]
+            for col, raw in zip(spec["columns"], values):
+                if not raw:
+                    continue
+                new_json = _reseal(raw, ring, target, spec["aad"])
+                if new_json is None:
+                    skipped += 1
+                    continue
+                db.execute(f"UPDATE {spec['table']} SET {col} = ?"  # noqa: S608
+                           f" WHERE {spec['id_col']} = ?", (new_json, row_id))
+                if reindex and col == reindex["source"]:
+                    parsed = envelope_from_json(new_json)
+                    from gd_crypto.suites import suite_for_aead_alg
+                    index_suite = (target if target is not None
+                                   else suite_for_aead_alg(parsed["alg"]))
+                    plain = decrypt_envelope(parsed, ring,
+                                             aad=spec["aad"]).decode("utf-8")
+                    db.execute(
+                        f"UPDATE {spec['table']} SET {reindex['index_col']} = ?"  # noqa: S608
+                        f" WHERE {spec['id_col']} = ?",
+                        (hmac_index(plain, ring.current_key, index_suite), row_id))
+                migrated += 1
+        state.advance(key, rows[-1][0], migrated, skipped)
+        audit.append(MIGRATE_ACTOR, "crypto_migration_progress",
+                     {"phase": key, "last_id": rows[-1][0],
+                      "migrated": migrated, "skipped": skipped}, LOCAL_IP)
+    state.mark_done(key)
+def _migrate_file_target(db, ring, target, spec, blob_dir, state, audit) -> None:
+    """@brief 迁移文件形态信封(按表行驱动定位文件,原子替换)"""
+    key = f"file:{spec['table']}"
+    if state.phase_done(key) or not blob_dir or not _table_exists(db, spec["table"]):
+        state.mark_done(key)
+        return
+    select_cols = ", ".join((spec["id_col"], spec["path_col"]) + spec["aad_cols"])
+    while True:
+        rows = db.query(
+            f"SELECT {select_cols} FROM {spec['table']}"  # noqa: S608
+            f" WHERE {spec['id_col']} > ? ORDER BY {spec['id_col']} LIMIT ?",
+            (state.cursor(key), PROGRESS_BATCH))
+        if not rows:
+            break
+        migrated = skipped = 0
+        for row in rows:
+            aad_ctx = dict(zip(spec["aad_cols"], row[2:]))
+            aad = spec["aad_template"].format(**aad_ctx).encode("utf-8")
+            full_path = os.path.join(blob_dir, row[1])
+            if not os.path.exists(full_path):
+                skipped += 1
+                continue
+            with open(full_path, "r", encoding="utf-8") as handle:
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 56/62 页 ——
+                new_json = _reseal(handle.read(), ring, target, aad)
+            if new_json is None:
+                skipped += 1
+                continue
+            tmp = full_path + ".migrate"
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(new_json)
+            os.replace(tmp, full_path)
+            migrated += 1
+        state.advance(key, rows[-1][0], migrated, skipped)
+        audit.append(MIGRATE_ACTOR, "crypto_migration_progress",
+                     {"phase": key, "last_id": rows[-1][0],
+                      "migrated": migrated, "skipped": skipped}, LOCAL_IP)
+    state.mark_done(key)
+def _password_report(db, target) -> dict:
+    """@brief 口令哈希分布统计(迁移不触碰:透明重哈希承接,H04 §8.2.5)"""
+    report = {}
+    for table, col in PASSWORD_TABLES:
+        try:
+            rows = db.query(f"SELECT {col} FROM {table} WHERE {col} IS NOT NULL")  # noqa: S608
+        except Exception:  # noqa: BLE001 缺表/缺列(分库部署形态)按无口令数据处理
+            continue
+        pending = sum(1 for (stored,) in rows if stored
+                      and target.password_needs_rehash(stored))
+        report[table] = {"total": len(rows), "pending_rehash": pending}
+    return report
+def run_key_rotation(db, ring: MasterKeyRing, audit, blob_dir: str = None,
+                     state_file: str = None) -> dict:
+    """
+    @brief  主密钥轮换(H06-E10 轮换=迁移):环境须同时注入新钥(MASTER_KEY_HEX)
+            与旧钥(OLD_MASTER_KEY_HEX);逐对象按原算法解包并用当前主密钥重包,
+            幂等、可断点。完成写 master_key_rotated 审计锚点。
+    @return 汇总报告 dict
+    """
+    state = MigrationState(state_file, f"rotate:{ring.current_kid}")
+    for spec in DB_ENVELOPE_TARGETS:
+        _migrate_db_target(db, ring, None, spec, state, audit)
+    for spec in FILE_ENVELOPE_TARGETS:
+        _migrate_file_target(db, ring, None, spec, blob_dir, state, audit)
+    total = sum(c["migrated"] for c in state.data["counts"].values())
+    audit.append(MIGRATE_ACTOR, "master_key_rotated",
+                 {"to_kid": ring.current_kid, "rewrapped": total}, LOCAL_IP)
+    return {"to_kid": ring.current_kid, "rewrapped": total,
+            "phases": state.data["counts"]}
+def run_migration(db, ring: MasterKeyRing, target: ICryptoSuite, audit,
+                  blob_dir: str = None, state_file: str = None) -> dict:
+    """
+    @brief  执行套件迁移全流程(可断点续迁:同一 state_file 重跑自动续接)
+    @param  db         目标数据库(六库同构,多库部署逐库调用)
+    @param  ring       主密钥环
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 57/62 页 ——
+    @param  target     目标套件
+    @param  audit      统一审计写入器(锚点:开始/进度/完成)
+    @param  blob_dir   文件信封目录(certvault 数据目录;无则跳过文件阶段)
+    @param  state_file 断点状态文件路径(None 则不落断点)
+    @return 汇总报告 dict
+    """
+    state = MigrationState(state_file, target.name)
+    if not state.data["done"] and not state.data["cursor"]:
+        audit.append(MIGRATE_ACTOR, "crypto_migration_started",
+                     {"target": target.name}, LOCAL_IP)
+    for spec in DB_ENVELOPE_TARGETS:
+        _migrate_db_target(db, ring, target, spec, state, audit)
+    for spec in FILE_ENVELOPE_TARGETS:
+        _migrate_file_target(db, ring, target, spec, blob_dir, state, audit)
+    report = {"target": target.name, "phases": state.data["counts"],
+              "password_pending_rehash": _password_report(db, target)}
+    audit.append(MIGRATE_ACTOR, "crypto_migration_completed",
+                 {"target": target.name,
+                  "migrated_total": sum(c["migrated"]
+                                        for c in state.data["counts"].values())},
+                 LOCAL_IP)
+    return report
+===== packages/gd_crypto/password.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    password.py
+@brief   口令哈希(自描述串 + 登录透明重哈希,H04 §8.2.5)与
+         HMAC 查询索引(手机号等 PI 的等值查询索引,H08 §1 / H12 §三.3)
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+from gd_common.errors import CryptoError
+from gd_crypto.suites import (
+    ALG_HMAC_SHA256,
+    ALG_HMAC_SM3,
+    ICryptoSuite,
+    get_suite,
+    SUITE_GM,
+    SUITE_INTL,
+)
+# 口令哈希前缀 → 所属套件(按存量记录自描述串选算法校验,H12 §三.2)
+_HASH_PREFIX_TO_SUITE = {
+    "$argon2id$": SUITE_INTL,
+    "pbkdf2-sm3$": SUITE_GM,
+}
+# HMAC 索引自描述前缀 → 套件
+_HMAC_ALG_TO_SUITE = {ALG_HMAC_SHA256: SUITE_INTL, ALG_HMAC_SM3: SUITE_GM}
+HMAC_INDEX_SEP = "$"
+def hash_password(password: str, suite: ICryptoSuite) -> str:
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 58/62 页 ——
+    """@brief 用当前套件生成自描述口令哈希 @return 哈希串"""
+    return suite.hash_password(password)
+def _suite_for_stored_hash(stored: str) -> ICryptoSuite:
+    """@brief 按存量哈希串前缀反查套件;未知前缀抛 CryptoError"""
+    for prefix, suite_name in _HASH_PREFIX_TO_SUITE.items():
+        if stored.startswith(prefix):
+            return get_suite(suite_name)
+    raise CryptoError("口令哈希格式无法识别(非自描述串)")
+def verify_password(password: str, stored: str, current: ICryptoSuite) -> tuple:
+    """
+    @brief  校验口令并支持透明重哈希:按存量串自带算法校验,成功且算法与当前套件
+            不一致(或参数过时)时返回新哈希供调用方回写(H04 §8.2.5)
+    @param  password 用户提交口令
+    @param  stored   存量自描述哈希串
+    @param  current  当前生效套件
+    @return (是否匹配, 新哈希或 None)
+    """
+    legacy_suite = _suite_for_stored_hash(stored)
+    if not legacy_suite.verify_password(password, stored):
+        return False, None
+    if current.password_needs_rehash(stored):
+        return True, current.hash_password(password)
+    return True, None
+def hmac_index(value: str, key: bytes, suite: ICryptoSuite) -> str:
+    """
+    @brief  生成等值查询用 HMAC 索引(自描述:alg$hex),用于手机号等密文列的检索
+    @param  value 明文值(如手机号);调用方不得将明文写日志(H04 §五)
+    @param  key   HMAC 索引密钥(独立于主密钥,轮换须重建索引列,H12 §三.3)
+    @param  suite 当前套件
+    @return 形如 "HMAC-SHA256$<hex>" 的自描述索引串
+    """
+    mac = suite.hmac(key, value.encode("utf-8"))
+    return f"{suite.hmac_alg}{HMAC_INDEX_SEP}{mac.hex()}"
+def hmac_index_matches(value: str, stored_index: str, key: bytes) -> bool:
+    """@brief 按存量索引自带 alg 选套件重算并比对(常数时间比较)"""
+    alg, _, _ = stored_index.partition(HMAC_INDEX_SEP)
+    if alg not in _HMAC_ALG_TO_SUITE:
+        raise CryptoError(f"未知 HMAC 索引算法: {alg}")
+    suite = get_suite(_HMAC_ALG_TO_SUITE[alg])
+    import hmac as _hmac_mod
+    return _hmac_mod.compare_digest(hmac_index(value, key, suite), stored_index)
+===== packages/gd_crypto/suites.py =====
+# -*- coding: utf-8 -*-
+"""
+@file    suites.py
+@brief   密码套件抽象(H04 §八 / H01 ARC-8):国际套件 intl 为默认实现,
+         国密套件 gm 预留扩展接口。业务代码零算法感知,MUST NOT 直呼具体算法库。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 59/62 页 ——
+"""
+import hashlib
+import hmac as _hmac
+import os
+from typing import Protocol
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from gd_common.errors import ConfigError, CryptoError
+# ---- 套件与算法名常量(禁魔法字符串,H07 L2-18) ----
+SUITE_INTL = "intl"
+SUITE_GM = "gm"
+ALG_AES_256_GCM = "AES-256-GCM"
+ALG_SM4_GCM = "SM4-GCM"
+ALG_HMAC_SHA256 = "HMAC-SHA256"
+ALG_HMAC_SM3 = "HMAC-SM3"
+ALG_SHA256 = "SHA-256"
+ALG_SM3 = "SM3"
+ALG_ARGON2ID = "argon2id"
+ALG_PBKDF2_SM3 = "pbkdf2-sm3"
+GCM_NONCE_LEN = 12          # GCM 标准随机数长度(字节)
+GCM_TAG_LEN = 16            # GCM 认证标签长度(字节),即存储完整性校验(H12 §三.4)
+ENV_CRYPTO_SUITE = "CRYPTO_SUITE"
+class ICryptoSuite(Protocol):
+    """密码套件接口:AEAD 加解密、HMAC、摘要、口令哈希四类原语的统一契约。"""
+    name: str
+    aead_alg: str
+    hmac_alg: str
+    hash_alg: str
+    password_alg: str
+    def aead_encrypt(self, key: bytes, nonce: bytes, plaintext: bytes, aad: bytes) -> tuple:
+        """@brief AEAD 加密 @return (ct, tag) 密文与认证标签分离返回"""
+        ...
+    def aead_decrypt(self, key: bytes, nonce: bytes, ct: bytes, tag: bytes, aad: bytes) -> bytes:
+        """@brief AEAD 解密,标签校验失败必须抛 CryptoError @return 明文"""
+        ...
+    def hmac(self, key: bytes, data: bytes) -> bytes:
+        """@brief 计算 HMAC @return 消息认证码"""
+        ...
+    def digest(self, data: bytes) -> bytes:
+        """@brief 计算摘要 @return 哈希值"""
+        ...
+    def hash_password(self, password: str) -> str:
+        """@brief 口令派生哈希 @return 自描述哈希串(H12 §三.2)"""
+        ...
+    def verify_password(self, password: str, stored: str) -> bool:
+        """@brief 校验口令 @return 是否匹配"""
+        ...
+    def password_needs_rehash(self, stored: str) -> bool:
+        """@brief 判断存量哈希是否需透明重哈希为当前套件算法(H04 §8.2.5)"""
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 60/62 页 ——
+        ...
+class IntlSuite:
+    """国际套件(默认):AES-256-GCM / HMAC-SHA256 / SHA-256 / argon2id。"""
+    name = SUITE_INTL
+    aead_alg = ALG_AES_256_GCM
+    hmac_alg = ALG_HMAC_SHA256
+    hash_alg = ALG_SHA256
+    password_alg = ALG_ARGON2ID
+    def __init__(self):
+        self._ph = PasswordHasher()
+    def aead_encrypt(self, key: bytes, nonce: bytes, plaintext: bytes, aad: bytes) -> tuple:
+        """@brief AES-256-GCM 加密 @return (ct, tag)"""
+        combined = AESGCM(key).encrypt(nonce, plaintext, aad)
+        return combined[:-GCM_TAG_LEN], combined[-GCM_TAG_LEN:]
+    def aead_decrypt(self, key: bytes, nonce: bytes, ct: bytes, tag: bytes, aad: bytes) -> bytes:
+        """@brief AES-256-GCM 解密;密文/标签被改动即抛 CryptoError(GCM 完整性)"""
+        try:
+            return AESGCM(key).decrypt(nonce, ct + tag, aad)
+        except Exception as exc:  # cryptography 抛 InvalidTag 等,统一收敛
+            raise CryptoError("AEAD 解密失败:密文或标签校验不通过") from exc
+    def hmac(self, key: bytes, data: bytes) -> bytes:
+        """@brief HMAC-SHA256"""
+        return _hmac.new(key, data, hashlib.sha256).digest()
+    def digest(self, data: bytes) -> bytes:
+        """@brief SHA-256 摘要"""
+        return hashlib.sha256(data).digest()
+    def hash_password(self, password: str) -> str:
+        """@brief argon2id 口令哈希;argon2 原生串以 $argon2id$ 开头,天然自描述"""
+        return self._ph.hash(password)
+    def verify_password(self, password: str, stored: str) -> bool:
+        """@brief 校验 argon2id 口令哈希"""
+        try:
+            return self._ph.verify(stored, password)
+        except (VerifyMismatchError, VerificationError, InvalidHashError):
+            return False
+    def password_needs_rehash(self, stored: str) -> bool:
+        """@brief 存量非 argon2id(如 gm 套件的 pbkdf2-sm3)或参数过时则需重哈希"""
+        if not stored.startswith("$argon2id$"):
+            return True
+        return self._ph.check_needs_rehash(stored)
+class GmSuite:
+    """
+    国密套件真实现(纯 Python 参考实现,GAP-01 解除):SM4-GCM / HMAC-SM3 /
+    SM3 / PBKDF2-HMAC-SM3。原语正确性由标准向量与 AES-GCM 对拍锚定
+    (tests/test_f_crypto_suite.py)。SM2 签名走 IdP 密钥仓专线(apps/idp/keys)。
+    """
+    name = SUITE_GM
+    aead_alg = ALG_SM4_GCM
+    hmac_alg = ALG_HMAC_SM3
+    hash_alg = ALG_SM3
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 61/62 页 ——
+    password_alg = ALG_PBKDF2_SM3
+    # 纯 Python 参考实现下的迭代折中(自描述串携带迭代数,后续提档无缝校验存量);
+    # 生产接入硬件/C 扩展国密 Provider 时 SHOULD 提至 ≥210000
+    PBKDF2_ITERATIONS = 2000
+    PBKDF2_SALT_LEN = 16
+    _SM4_KEY_LEN = 16
+    def _sm4_core(self, key: bytes):
+        """@brief 由输入密钥派生 SM4 单块加密内核:32 字节 DEK/主密钥经 SM3
+        单向压缩为 128bit SM4 密钥(确定性,加解密两侧一致)"""
+        from gd_crypto.gm.sm3 import sm3_digest
+        from gd_crypto.gm.sm4 import encrypt_block, expand_key
+        sm4_key = key if len(key) == self._SM4_KEY_LEN else sm3_digest(key)[:self._SM4_KEY_LEN]
+        round_keys = expand_key(sm4_key)
+        return lambda block: encrypt_block(round_keys, block)
+    def aead_encrypt(self, key: bytes, nonce: bytes, plaintext: bytes, aad: bytes) -> tuple:
+        """@brief SM4-GCM 加密 @return (ct, tag)"""
+        from gd_crypto.gm.gcm import gcm_encrypt
+        return gcm_encrypt(self._sm4_core(key), nonce, plaintext, aad)
+    def aead_decrypt(self, key: bytes, nonce: bytes, ct: bytes, tag: bytes, aad: bytes) -> bytes:
+        """@brief SM4-GCM 解密;标签校验失败抛 CryptoError(gcm 层保证)"""
+        from gd_crypto.gm.gcm import gcm_decrypt
+        return gcm_decrypt(self._sm4_core(key), nonce, ct, tag, aad)
+    def hmac(self, key: bytes, data: bytes) -> bytes:
+        """@brief HMAC-SM3"""
+        from gd_crypto.gm.sm3 import hmac_sm3
+        return hmac_sm3(key, data)
+    def digest(self, data: bytes) -> bytes:
+        """@brief SM3 摘要"""
+        from gd_crypto.gm.sm3 import sm3_digest
+        return sm3_digest(data)
+    def hash_password(self, password: str) -> str:
+        """@brief PBKDF2-HMAC-SM3 口令哈希,自描述串 pbkdf2-sm3$iters$salt$hash"""
+        from gd_crypto.gm.sm3 import pbkdf2_hmac_sm3
+        salt = os.urandom(self.PBKDF2_SALT_LEN)
+        derived = pbkdf2_hmac_sm3(password.encode("utf-8"), salt, self.PBKDF2_ITERATIONS)
+        return f"pbkdf2-sm3${self.PBKDF2_ITERATIONS}${salt.hex()}${derived.hex()}"
+    def verify_password(self, password: str, stored: str) -> bool:
+        """@brief 校验 pbkdf2-sm3 自描述串(常数时间比较);格式非法返回 False"""
+        from gd_crypto.gm.sm3 import pbkdf2_hmac_sm3
+        parts = stored.split("$")
+        if len(parts) != 4 or parts[0] != "pbkdf2-sm3":
+            return False
+        try:
+            iterations, salt, expected = int(parts[1]), bytes.fromhex(parts[2]), parts[3]
+        except ValueError:
+            return False
+        derived = pbkdf2_hmac_sm3(password.encode("utf-8"), salt, iterations)
+        return _hmac.compare_digest(derived.hex(), expected)
+    def password_needs_rehash(self, stored: str) -> bool:
+        """@brief 非本套件格式(如存量 argon2id)或迭代数低于当前档 → 需透明重哈希"""
+
+—— 港电 UniPass 统一身份认证与单点登录平台 V2.0 · 第 62/62 页 ——
+        parts = stored.split("$")
+        if len(parts) != 4 or parts[0] != "pbkdf2-sm3":
+            return True
+        try:
+            return int(parts[1]) < self.PBKDF2_ITERATIONS
+        except ValueError:
+            return True
+# 套件注册表:解密/验证按对象元数据选套件的唯一入口
+_REGISTRY: dict = {SUITE_INTL: IntlSuite(), SUITE_GM: GmSuite()}
+# AEAD 算法名 → 套件反查(解密按密文对象自带 alg 选算法,H04 §8.2.2)
+_AEAD_TO_SUITE: dict = {ALG_AES_256_GCM: SUITE_INTL, ALG_SM4_GCM: SUITE_GM}
+_HASH_TO_SUITE: dict = {ALG_SHA256: SUITE_INTL, ALG_SM3: SUITE_GM}
+def get_suite(name: str) -> ICryptoSuite:
+    """@brief 按套件名取实现 @param name intl|gm @return 套件实例"""
+    if name not in _REGISTRY:
+        raise ConfigError(f"未知密码套件: {name}(可选 {sorted(_REGISTRY)})")
+    return _REGISTRY[name]
+def suite_for_aead_alg(alg: str) -> ICryptoSuite:
+    """@brief 按密文对象的 alg 元数据反查套件(存量数据永远可解的关键)"""
+    if alg not in _AEAD_TO_SUITE:
+        raise CryptoError(f"未知 AEAD 算法: {alg}")
+    return get_suite(_AEAD_TO_SUITE[alg])
+def suite_for_hash_alg(alg: str) -> ICryptoSuite:
+    """@brief 按审计记录的 alg 元数据反查套件(链校验逐条选算法,H12 §四)"""
+    if alg not in _HASH_TO_SUITE:
+        raise CryptoError(f"未知摘要算法: {alg}")
+    return get_suite(_HASH_TO_SUITE[alg])
+def current_suite(environ: dict = None) -> ICryptoSuite:
+    """
+    @brief  解析当前生效套件:CRYPTO_SUITE 环境变量,默认 intl(H04 §8.2.8)
+    @param  environ 环境字典(测试注入用),缺省取 os.environ
+    @return 套件实例;与 DEMO 模式正交,任何运行模式下套件行为一致(H05 §2)
+    """
+    env = os.environ if environ is None else environ
+    return get_suite(env.get(ENV_CRYPTO_SUITE, SUITE_INTL))

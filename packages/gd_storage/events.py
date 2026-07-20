@@ -42,6 +42,7 @@ CRYPTO_SUITE_CHANGED = "crypto_suite_changed"    # 密码套件切换锚点(H04 
 CRYPTO_MIGRATION_STARTED = "crypto_migration_started"      # 套件迁移开始(13-R-IDP-2)
 CRYPTO_MIGRATION_PROGRESS = "crypto_migration_progress"    # 套件迁移进度批次(13-R-IDP-2)
 CRYPTO_MIGRATION_COMPLETED = "crypto_migration_completed"  # 套件迁移完成(13-R-IDP-2)
+MASTER_KEY_ROTATED = "master_key_rotated"                  # 主密钥轮换完成(H06-E10 轮换=迁移)
 AI_ACTION_EXECUTED = "ai_action_executed"        # AI 动作执行/dry-run/回滚(13-R-F3D-2,v2.0 新增)
 MIGRATION_PROGRESS = "migration_progress"        # 套件迁移进度锚点(13-R-IDP-2,v2.0 新增)
 
