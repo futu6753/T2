@@ -31,6 +31,7 @@ from apps.rp_common.accounts import (
     ROLE_ADMIN, ROLE_USER, RpAccountService, STATUS_ACTIVE,
 )
 from apps.rp_common.forms import read_form
+from apps.rp_common.spa import healthz_extras, mount_spa
 from apps.rp_common.sso_routes import build_sso_router, require_session
 
 _log = get_logger("certvault.web")
@@ -162,11 +163,14 @@ def error_response(exc: PolicyValidationError) -> JSONResponse:
 
 def create_app(db, ring, suite, store, sso, blob_dir: str = None,
                registry: EngineRegistry = None,
-               allow_open_register: bool = False) -> FastAPI:
+               allow_open_register: bool = False,
+               profile=None, spa_dist: str = None) -> FastAPI:
     """
     @brief  装配 certvault 应用(31 条路由分区挂载)
     @param  store    易失态(锁定计数/SSO 会话)
     @param  blob_dir 密文 blob 目录(None=临时目录,生产必须指定 data/blobs)
+    @param  profile  SecurityProfile(healthz 横切徽标,H11 §二;可缺省)
+    @param  spa_dist SPA 构建产物目录(缺省 apps/certvault/web/dist)
     """
     from apps.certvault.web_certs import build_certs_router
     from apps.certvault.web_issue import build_issue_router
@@ -303,6 +307,13 @@ def create_app(db, ring, suite, store, sso, blob_dir: str = None,
     def healthz():
         """@brief 统一横切健康检查(兼容里程碑 3 断言)"""
         return {"status": "ok", "system": SYSTEM,
-                "sso_enabled": sso.status()["enabled"]}
+                "sso_enabled": sso.status()["enabled"],
+                **healthz_extras(profile)}
+
+    # ---- F2 SPA 静态托管(H11 §一:/app + history 兜底;里程碑 9) ----
+    import os as _os
+    dist = spa_dist or _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                     "web", "dist")
+    mount_spa(app, dist)
 
     return app

@@ -1,0 +1,12 @@
+{
+  "name": "@gd/ui-kit",
+  "private": true,
+  "version": "2.0.0",
+  "description": "前端共享资产内部包(H11 §一):fetch 封装/DEMO 横幅/打码/设置页/基础组件/CSS 设计变量",
+  "type": "module",
+  "main": "src/index.ts",
+  "peerDependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  }
+}

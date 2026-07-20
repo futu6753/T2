@@ -39,6 +39,15 @@ def build_sso_router(sso: SsoClient, accounts: RpAccountService,
         """@brief 登录页据此显隐 SSO 按钮(H08 §3)"""
         return sso.status()
 
+    @router.get("/sso/me")
+    def sso_me(request: Request):
+        """@brief 当前会话身份(SPA 壳统一探测;未登录 401,里程碑 9 增量)"""
+        user, error = require_session(request, sso, accounts,
+                                      cookie_name=cookie_name)
+        if error:
+            return error
+        return {"username": user["username"], "role": user["role"]}
+
     @router.get("/sso/login")
     def sso_login(next: str = "/"):
         """@brief 生成 state/nonce/PKCE 并 302 到 IdP authorize"""

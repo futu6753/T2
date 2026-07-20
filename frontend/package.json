@@ -1,0 +1,25 @@
+{
+  "name": "gd-frontend",
+  "private": true,
+  "version": "2.0.0",
+  "description": "港电实验室统一平台前端工作区(H11 三形态之 F2 SPA + ui-kit)",
+  "workspaces": [
+    "ui-kit",
+    "quiz",
+    "certvault",
+    "nvr",
+    "adapter"
+  ],
+  "scripts": {
+    "build": "npm run build -w quiz -w certvault -w nvr -w adapter",
+    "lint": "eslint . && prettier --check .",
+    "fmt": "prettier --write ."
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "eslint": "^9.17.0",
+    "prettier": "^3.4.2",
+    "typescript": "~5.6.3",
+    "typescript-eslint": "^8.19.0"
+  }
+}

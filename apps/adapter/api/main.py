@@ -41,6 +41,7 @@ ADAPTER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_ROOT = os.path.dirname(os.path.dirname(ADAPTER_DIR))
 MAPPINGS_DIR = os.path.join(REPO_ROOT, "harness", "mappings")
 CONSOLE_PATH = os.path.join(ADAPTER_DIR, "web", "console.html")
+SPA_DIST = os.path.join(ADAPTER_DIR, "web", "dist")   # F2 管理 SPA(里程碑 9)
 
 
 def load_specs(directory: str = MAPPINGS_DIR) -> dict:
@@ -135,6 +136,8 @@ def create_app(settings: Settings = None, transports: dict = None,
     _mount_status_routes(app, ctx)
     _mount_command_routes(app, ctx)
     _mount_webhook_routes(app, ctx)
+    from apps.rp_common.spa import mount_spa
+    mount_spa(app, SPA_DIST)          # include_in_schema=False:openapi 契约零漂移
     return app
 
 

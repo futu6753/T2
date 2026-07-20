@@ -131,6 +131,7 @@ def create_app(db, suite, sso, ring=None, **options) -> FastAPI:
             生产必须传平台主密钥环)
     """
     from gd_crypto import MasterKeyRing
+    from apps.rp_common.spa import healthz_extras, mount_spa
     from apps.nvr.web_status import build_status_router
     from apps.nvr.web_ops import build_ops_router
     from apps.nvr.web_settings import build_settings_router
@@ -244,8 +245,15 @@ def create_app(db, suite, sso, ring=None, **options) -> FastAPI:
 
     @app.get("/healthz")
     def healthz():
-        """@brief 健康检查"""
+        """@brief 健康检查(横切附运行模式+密码套件,H11 §二)"""
         return {"status": "ok", "system": SYSTEM,
-                "sso_enabled": sso.status()["enabled"]}
+                "sso_enabled": sso.status()["enabled"],
+                **healthz_extras(options.get("profile"))}
+
+    # ---- F2 SPA 静态托管(H11 §一:/app + history 兜底;里程碑 9) ----
+    import os as _os
+    dist = options.get("spa_dist") or _os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)), "web", "dist")
+    mount_spa(app, dist)
 
     return app

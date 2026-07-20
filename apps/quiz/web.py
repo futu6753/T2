@@ -18,6 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from apps.rp_common.accounts import ROLE_ADMIN, ROLE_USER, RpAccountService
+from apps.rp_common.spa import healthz_extras, mount_spa
 from apps.rp_common.sso_routes import build_sso_router, require_session
 
 from apps.quiz import migrate as mig
@@ -33,10 +34,13 @@ GUEST_CODE_DIGITS = 5
 GUEST_CODE_ATTEMPTS = 50           # 5 位数字空间冲突重试上限
 
 
-def create_app(db, suite, sso, guest_mode_enabled: bool = True) -> FastAPI:
+def create_app(db, suite, sso, guest_mode_enabled: bool = True,
+               profile=None, spa_dist: str = None) -> FastAPI:
     """
     @brief  装配 quiz 骨架应用
     @param  guest_mode_enabled quiz_guest_mode 开关(H03 §6,默认 true)
+    @param  profile  SecurityProfile(healthz 横切徽标,H11 §二;可缺省)
+    @param  spa_dist SPA 构建产物目录(缺省 apps/quiz/web/dist)
     """
     app = FastAPI(title="港电 安全刷题", docs_url=None, redoc_url=None)
     accounts = RpAccountService(db, suite, table="quiz_users",
@@ -79,7 +83,11 @@ def create_app(db, suite, sso, guest_mode_enabled: bool = True) -> FastAPI:
         rows = db.query("SELECT id FROM quiz_guests WHERE guest_code = ?", (code,))
         if not rows:
             return JSONResponse({"error": "游客 ID 不存在"}, status_code=404)
-        return {"guest_code": code, "progress": "占位(里程碑 7 交付)"}
+        # 载入 = 换发游客 Cookie(界面承接,H11 §二:输 ID 载入进度)
+        summary = practice.progress_summary(f"guest:{code}")
+        response = JSONResponse({"guest_code": code, "progress": summary})
+        response.set_cookie(GUEST_COOKIE, code, httponly=True, samesite="lax")
+        return response
 
     @app.get("/me")
     def whoami(request: Request):
@@ -98,7 +106,8 @@ def create_app(db, suite, sso, guest_mode_enabled: bool = True) -> FastAPI:
         """@brief 健康检查"""
         return {"status": "ok", "system": SYSTEM,
                 "sso_enabled": sso.status()["enabled"],
-                "guest_mode": guest_mode_enabled}
+                "guest_mode": guest_mode_enabled,
+                **healthz_extras(profile)}
 
     # ================= 里程碑 7:刷题业务面 =================
     seed_bank(db)                      # 幂等导入 233 题(H02-E1)
@@ -288,5 +297,11 @@ def create_app(db, suite, sso, guest_mode_enabled: bool = True) -> FastAPI:
         if not result["ok"]:
             return JSONResponse({"error": result["error"]}, status_code=400)
         return result
+
+    # ---- F2 SPA 静态托管(H11 §一:/app + history 兜底;里程碑 9) ----
+    import os as _os
+    dist = spa_dist or _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                     "web", "dist")
+    mount_spa(app, dist)
 
     return app
