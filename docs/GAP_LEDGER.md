@@ -4,7 +4,7 @@
 
 | 编号 | 内容 | 位置 | 解除条件 | 状态 |
 |---|---|---|---|---|
-| GAP-01 | 国密套件 gm 为占位实现,调用抛明确错误,禁止静默降级 | `gd_crypto/suites.py` GmSuiteStub;`gd_sso_client/jwt_verify.py` SM2 验签 | 目标环境接入国密 Provider 后替换,并跑 H09-F gm 冒烟 | 未解除 |
+| GAP-01 | 国密套件 gm 为占位实现,调用抛明确错误,禁止静默降级 | `gd_crypto/suites.py` GmSuiteStub;`gd_sso_client/jwt_verify.py` SM2 验签 | 目标环境接入国密 Provider 后替换,并跑 H09-F gm 冒烟 | **已解除(里程碑 10)**:`gd_crypto/gm/` 纯 Python 参考实现(SM3/SM4-GCM/SM2,标准向量+AES-GCM 对拍锚定);F 组 11 用例全绿(冒烟/切换/迁移/DEMO 正交/profile)。生产提档路径:接入硬件或合规 Provider 时仅需替换 `GmSuite` 内核函数,接口与信封格式不变;PBKDF2 迭代数同步提档(见 suites.py 注释) |
 | GAP-02 | 自检 DSL 中 D4/D5 为 http 级断言,待 IdP 端点落地后转强制 | `selfcheck/demo_items.yaml` | 里程碑 2 IdP 上线,注册 http 检查函数并删除 pending 字段 | **已解除(里程碑 2)**:`selfcheck/registry.py` HTTP_CHECKS + 进程内 ASGI 执行;回归 `test_r_idp3_http_assertions_demo_and_prod` |
 | GAP-03 | PostgreSQL 全量测试未在本环境执行(无 PG 服务) | `ci_gate.sh` 提供 GD_TEST_PG_URL 一键入口 | 目标环境设 GD_TEST_PG_URL 后跑双库同测(H09-J.1) | 未解除 |
 | GAP-04 | Redis 集成测试未在本环境执行(无 Redis 服务);fail-closed 语义已有 mock 级活体测试 | `tests/test_audit_storage.py` | 目标环境起 Redis 后跑跨实例累加/宕机 fail-closed(H09-J.4) | 未解除 |

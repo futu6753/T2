@@ -403,3 +403,49 @@ nvr 发现 6 条路由缺口与 3 个工件缺口,全部补齐。
   `#scene` 占位文案更新;数据壳既有元素与 `window.F3D_VER` 注入不变。
 - IdP HTML 响应新增安全头(见上);登录页 CSP 不设 form-action(会拦截
   表单提交后跨源 302 授权链,Chrome 语义),管理区保留全量严格头。
+
+
+## 里程碑 10(2026-07-20)· 国密套件真实现 + 迁移体系 + 三包流水线 + 部署包
+
+### 新增
+- **GAP-01 解除**:`gd_crypto/gm/` 国密四原语纯 Python 参考实现——
+  SM3(GB/T 32905 双向量)、SM4(GB/T 32907 单块向量;100 万次迭代
+  向量开发期全量验证)、GCM 模式层(SP 800-38D,与 cryptography
+  AES-GCM 随机对拍逐字节一致)、SM2 签验(GB/T 32918.5 标准密钥对
+  向量)。`GmSuite` 接替占位:SM4-GCM 信封 / HMAC-SM3 索引 /
+  PBKDF2-SM3 口令 / SM2-with-SM3 令牌;JWKS 双钥(RSA+SM2)。
+- **13-R-IDP-2 迁移体系**:信封双写窗口(`CRYPTO_DUAL_WRITE`,dual 段
+  两套件独立可解、主段失败自动回退);`gd_crypto/migrate.py` 声明式
+  迁移核心(8 个 DB 信封列 + 2 类文件信封 + AAD 全映射 + HMAC 索引
+  重算,断点续迁状态机,开始/进度/完成审计锚点);
+  `scripts/migrate_crypto_suite.py`(SQLite 强制自动备份 / PG 须
+  `--i-have-backup`);`scripts/rotate_master_key.py`(H06-E10
+  轮换=迁移:算法不变仅重包,`master_key_rotated` 锚点)。
+- **F 组验收**:`tests/test_f_crypto_suite.py` 11 用例(原语向量×4 /
+  gm 冒烟 / 切换存量兼容+透明重哈希 / `test_r_idp2_migrate` 中断续迁
+  与一次性等价 / E10 轮换 / DEMO 正交 / profile 双断言)。
+- **基线补齐(B1-B10 全覆盖)**:`benchmarks/common.py` 环境指纹 +
+  CSV 归档(benchmarks/data/);B2 认证可用性(登录时延/C08 存活/
+  迁移吞吐/双写开销)、B4 模式切换(耗时+自检样例)、B7 助手安全
+  (六类 50 条恶意指令 50/50 拒绝、误执行 0)。
+- **H10 三包流水线**:`make copyright-pack|paper-pack|patent-pack` →
+  `dist/` 六系统×3 包(源码打印稿前 30+后 30 页真实抽取、概况页
+  行数实统、手册/设计说明、方法稿+可复现说明+基线数据表挂载、
+  技术交底书+权利要求候选,全部带 R-xx 锚点与内部标签)。
+- **部署包**:`deploy/Dockerfile`、`harden.sh`(六步加固含 NTP)、
+  `backup_cron.sh`(每日备份+保留 14 天)、`env.example`、
+  `scripts/run_rp.py` 四 RP 统一生产入口(compose 命令对齐);
+  `scripts/reset_admin.py`、`scripts/smoke.py`(healthz 套件/模式
+  一致性)。
+- **文档**:部署手册、问题解决指南、等保三级对照表、PIPL 清单与
+  PIA 模板、轮换 Runbook×3(主密钥/套件/HMAC 索引)、升级说明模板。
+
+### 行为变化
+- 新增迁移 v9:`platform_meta` 表(key-value,当前仅 crypto_suite)。
+- 服务启动新增套件守卫:与上次生效套件不同写 `crypto_suite_changed`
+  审计事件(首次 intl 不算切换);gm 生效输出大写提示日志。
+- 事件字典新增:`crypto_migration_started/progress/completed`、
+  `master_key_rotated`。
+- 信封格式向后兼容扩展:双写窗口开启时新增 `dual` 段(旧读取方
+  忽略该字段不受影响);`encrypt_envelope` 新增可选 `environ` 参数。
+- `deploy/docker-compose.reference.yml` 预置 `CRYPTO_SUITE=intl`。

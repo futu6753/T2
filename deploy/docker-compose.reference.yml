@@ -27,6 +27,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       MASTER_KEY_HEX: ${MASTER_KEY_HEX:?生产必须注入}
       MASTER_KEY_ID: ${MASTER_KEY_ID:-mk1}
+      CRYPTO_SUITE: ${CRYPTO_SUITE:-intl}   # 统一预置 intl;切 gm 须全实例一致并走迁移(H04 §8.2)
       IDP_KEY_DIR: /data/keys          # 共享卷:两实例同一 RSA 私钥 → kid 恒定
     volumes: ["idpkeys:/data/keys"]
     depends_on: [postgres, redis]
@@ -36,7 +37,7 @@ services:
 
   certvault-1: &certvault
     build: .
-    command: python scripts/run_certvault.py --host 0.0.0.0 --port 9100
+    command: python scripts/run_rp.py certvault --host 0.0.0.0 --port 9100
     environment:
       <<: *idp_env
       SSO_ISSUER: https://sso.gangdian.internal
