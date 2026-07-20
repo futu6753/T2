@@ -75,10 +75,11 @@ class HttpTransport:
 class LiveIdpEnv(IdpEnv):
     """issuer 指向真实端口的 IdP 测试环境(浏览器可直接访问)。"""
 
-    def __init__(self, issuer: str, is_demo: bool = False):
+    def __init__(self, issuer: str, is_demo: bool = False,
+                 extra_environ: dict = None):
         """@brief 先记 issuer 再走父类构建(restart 会用到)"""
         self.issuer = issuer
-        super().__init__(is_demo=is_demo)
+        super().__init__(is_demo=is_demo, extra_environ=extra_environ)
 
     def _environ(self) -> dict:
         """@brief 在父类环境上注入 IDP_ISSUER(H08:发现文档指向真实地址)"""
@@ -91,14 +92,16 @@ class LiveStack:
     """IdP + 一个 RP 的双真实服务装配(供浏览器全链路用例)。"""
 
     def __init__(self, rp_factory, rp_system: str, rp_client_id: str,
-                 extra_env: dict = None):
+                 extra_env: dict = None, idp_extra_environ: dict = None):
         """
         @brief  组建双服务:先取两端口→构建 IdP(issuer=真实地址)→注册 RP→
                 以真 HTTP 传输层装配 SsoClient→拉起两台 uvicorn
-        @param  rp_factory callable(db, suite, sso) → FastAPI 应用
+        @param  rp_factory        callable(db, suite, sso) → FastAPI 应用
+        @param  idp_extra_environ IdP 追加环境(如 CRYPTO_SUITE=gm,里程碑 10)
         """
         idp_port, rp_port = pick_port(), pick_port()
-        self.idp_env = LiveIdpEnv(f"http://127.0.0.1:{idp_port}")
+        self.idp_env = LiveIdpEnv(f"http://127.0.0.1:{idp_port}",
+                                  extra_environ=idp_extra_environ)
         self.idp_env.seed_admin_and_user()
         self.rp_base = f"http://127.0.0.1:{rp_port}"
         redirect = f"{self.rp_base}/sso/callback"

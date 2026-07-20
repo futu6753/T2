@@ -17,7 +17,18 @@ interface RouterState {
   navigate: (to: string) => void;
 }
 
-const RouterCtx = createContext<RouterState>({ path: '/', navigate: () => undefined });
+/**
+ * @brief 全局导航(pushState + 显式派发 popstate,Router 据此单源更新)。
+ *        修复(里程碑 10 浏览器全链路 E2E):TopBar 导航等渲染在 <Router>
+ *        Provider 之外的 Link,此前拿到默认 navigate=空操作 → 四 SPA 顶部
+ *        导航整体失效;默认值改为本函数后 Provider 内外行为一致。
+ */
+export function globalNavigate(to: string): void {
+  window.history.pushState(null, '', to);
+  window.dispatchEvent(new PopStateEvent('popstate'));
+}
+
+const RouterCtx = createContext<RouterState>({ path: '/', navigate: globalNavigate });
 const ParamsCtx = createContext<Record<string, string>>({});
 
 /** @brief 读取当前路由参数(:param 段) */
@@ -51,10 +62,7 @@ export function Router(props: { routes: RouteDef[]; fallback?: React.ReactNode }
     return () => window.removeEventListener('popstate', onPop); // 生命周期清理(H11 §四.8)
   }, []);
 
-  const navigate = (to: string): void => {
-    window.history.pushState(null, '', to);
-    setPath(new URL(to, window.location.origin).pathname);
-  };
+  const navigate = globalNavigate; // 单源:pushState → popstate 事件 → onPop setPath
 
   let matched: React.ReactNode = props.fallback ?? <div className="gd-empty">页面不存在</div>;
   let params: Record<string, string> = {};
@@ -80,7 +88,14 @@ export function Link(props: {
   className?: string;
   exact?: boolean;
 }): JSX.Element {
-  const { path, navigate } = useContext(RouterCtx);
+  const { navigate } = useContext(RouterCtx);
+  // active 态自行订阅 popstate(不依赖 ctx.path:Provider 外同样正确)
+  const [path, setPath] = useState<string>(window.location.pathname);
+  useEffect(() => {
+    const onPop = (): void => setPath(window.location.pathname);
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
   const isActive = props.exact ? path === props.to : path.startsWith(props.to);
   const cls = [props.className ?? '', isActive ? 'active' : ''].join(' ').trim();
   const click_cb = (e: React.MouseEvent): void => {

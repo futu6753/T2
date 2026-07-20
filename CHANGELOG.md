@@ -449,3 +449,27 @@ nvr 发现 6 条路由缺口与 3 个工件缺口,全部补齐。
 - 信封格式向后兼容扩展:双写窗口开启时新增 `dual` 段(旧读取方
   忽略该字段不受影响);`encrypt_envelope` 新增可选 `environ` 参数。
 - `deploy/docker-compose.reference.yml` 预置 `CRYPTO_SUITE=intl`。
+
+### 浏览器全链路验证补遗(2026-07-20 晚,Playwright + chromium)
+- 新增 `tests/e2e/test_e2e_m10_gm.py` 两条真服务全链:
+  ① gm 套件 SSO 链(healthz=gm / JWKS 双钥 / 浏览器登录闭环 =
+  SM2-with-SM3 令牌真 HTTP 签发-验签);② gm 套件 certvault SPA 四步链
+  (本地登录→上传→生成水印件→溯源命中,JWT 内存特例全程站内导航;
+  服务端佐证 blob 信封 alg=SM4-GCM 与审计链)。全量回归 262 项。
+- **真缺陷三条(仅真浏览器可暴露,均已修复)**:
+  1. SPA↔API 证件类型契约断裂:前端自由文本 vs 后端五枚举 → 浏览器
+     上传必 400。修复:`web_certs.normalize_cert_type` 关键词归一化,
+     未识别归 other 且原文并入 label;store 枚举约束不动。
+  2. 共享 multipart 解析器炸空值字段:`strip(b"\r\n")` 贪婪剥离吃掉
+     空体段(浏览器 FormData 常态)的头体分隔符 → 500。修复:首尾各剥
+     一个 CRLF(协议语义),同时消除对二进制文件尾 CR/LF 字节的
+     潜在损坏风险(`apps/rp_common/multipart.py`)。
+  3. 平台级:四 SPA 顶部导航整体失效——TopBar 的 Link 渲染在 Router
+     Provider 之外,默认 `navigate` 为空操作;certvault 叠加 JWT 内存态,
+     本地用户被困证件库页。修复:ui-kit `globalNavigate`(pushState +
+     显式派发 popstate 单源更新)作为上下文默认值,Link 的 active 态
+     自行订阅 popstate,Provider 内外行为一致;四 SPA 重建。
+- 环境更正:构建机 node v22 实际可用(此前 lint 跳过系 node_modules
+  未安装)——eslint + prettier 本次起在 CI 第 6 步真跑并通过。
+- 测试基建:`tests/e2e/live.py` LiveIdpEnv/LiveStack 支持
+  `idp_extra_environ`(注入 CRYPTO_SUITE=gm 等)。

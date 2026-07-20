@@ -31,7 +31,14 @@ def parse_multipart(body: bytes, content_type: str) -> tuple:
     fields, files = {}, {}
     parts = body.split(boundary)
     for part in parts[1:-1]:                      # 首段为空、末段为 "--\r\n"
-        segment = part.strip(b"\r\n")
+        # 段格式:\r\n{headers}\r\n\r\n{content}\r\n——只剥首尾各一个 CRLF。
+        # 不得用 strip(b"\r\n"):空值字段(浏览器 FormData 常态)的体为空,
+        # 贪婪剥离会连头体分隔符一起吃掉(里程碑 10 浏览器全链路 E2E 发现)。
+        segment = part
+        if segment.startswith(b"\r\n"):
+            segment = segment[2:]
+        if segment.endswith(b"\r\n"):
+            segment = segment[:-2]
         if not segment or segment == b"--":
             continue
         if b"\r\n\r\n" not in segment:
