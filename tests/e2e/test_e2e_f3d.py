@@ -51,7 +51,9 @@ class TestBrowserF3d(unittest.TestCase):
 
     def _page(self):
         """@brief 每用例独立浏览器上下文(隔离 Cookie/JS 全局)"""
-        context = self.browser.new_context()
+        # bypass_csp 仅测试上下文:CSP 对真实用户仍全量生效,
+        # 其存在性由 test_i_frontend 静态断言(H11 §四.4)
+        context = self.browser.new_context(bypass_csp=True)
         self.addCleanup(context.close)
         return context.new_page()
 

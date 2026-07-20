@@ -13,8 +13,10 @@ Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
 import hmac
 import json
 
+import os
+
 from fastapi import FastAPI, Request, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from apps.factory3d import layout as lo
 from apps.factory3d import stream
@@ -82,13 +84,37 @@ def create_app(db, suite, sso, admin_token: str = "", ring=None,
     # ---- 公开面 -----------------------------------------------------------
     @app.get("/")
     def big_screen(request: Request):
-        """@brief 大屏首页(公开):浏览器得 HTML 数据壳,API 得 JSON 契约"""
+        """@brief 大屏首页(公开):浏览器得 HTML 数据壳,API 得 JSON 契约。
+        内联脚本走 per-response nonce CSP(H11 §四.4,禁 unsafe-inline)。"""
         if "text/html" in request.headers.get("accept", ""):
-            return HTMLResponse(render_big_screen(
+            import secrets as _secrets
+            nonce = _secrets.token_urlsafe(16)
+            response = HTMLResponse(render_big_screen(
                 ctx.settings.get("f3d_site_name"), F3D_VER,
-                ctx.settings.get("f3d_min_icon_px")))
+                ctx.settings.get("f3d_min_icon_px"), nonce=nonce))
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; "
+                f"script-src 'self' 'nonce-{nonce}'; "
+                "style-src 'unsafe-inline'; img-src 'self' data:; "
+                "connect-src 'self' ws: wss:; object-src 'none'; "
+                "base-uri 'self'; frame-ancestors 'self'")
+            return response
         return {"public": True, "system": SYSTEM, "version": F3D_VER,
                 "data_rev": ctx.data_rev}
+
+    @app.get("/static/{static_path:path}", include_in_schema=False)
+    def static_assets(static_path: str):
+        """@brief F3 静态资产(scene.js + Three.js 本地副本,ARC-5 同源)"""
+        from apps.rp_common.spa import _safe_join
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+        full = _safe_join(base, static_path)
+        if full and os.path.isfile(full):
+            media = "text/javascript" if full.endswith(".js") else \
+                "application/octet-stream"
+            return FileResponse(full, media_type=media, headers={
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-cache"})
+        return JSONResponse({"error": "静态资产不存在"}, status_code=404)
 
     @app.get("/healthz")
     def healthz():

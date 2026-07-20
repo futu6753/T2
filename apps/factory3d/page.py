@@ -52,6 +52,8 @@ _SCRIPT = """
     }
     window.__dataRev = frame.data_rev;
     window.__lastFrame = frame;
+    // 里程碑 9:单 WS 帧转发给三维场景(scene.js 监听,避免双连接)
+    window.dispatchEvent(new CustomEvent("f3d-frame", { detail: frame }));
   }
   function connect() {
     ws = new WebSocket(proto + location.host + "/ws");
@@ -64,6 +66,7 @@ _SCRIPT = """
     };
   }
   window.__reportFps = function (value) {   // 测试/低端机可直接驱动
+    setText("fps-chip", Math.round(value) + " fps");
     if (ws && ws.readyState === 1) {
       ws.send(JSON.stringify({ type: "fps", value: value }));
     }
@@ -107,8 +110,10 @@ ul { list-style: none; margin: 0; padding: 0; max-height: 60vh;
 """
 
 
-def render_big_screen(site_name: str, version: str, min_icon_px: int) -> str:
-    """@brief 渲染大屏数据壳(站点名 html.escape;window.F3D_VER 注入,L03 §8)"""
+def render_big_screen(site_name: str, version: str, min_icon_px: int,
+                      nonce: str = "") -> str:
+    """@brief 渲染大屏数据壳(站点名 html.escape;window.F3D_VER 注入,L03 §8;
+            nonce 供 CSP 放行两段内联脚本,H11 §四.4)"""
     safe_site = html.escape(site_name)
     return f"""<!doctype html><html lang="zh-CN"><head>
 <meta charset="utf-8"><title>{safe_site} · 三维物联监控大屏</title>
@@ -131,12 +136,13 @@ def render_big_screen(site_name: str, version: str, min_icon_px: int) -> str:
   <section><h4>事件流</h4><ul id="event-list"></ul></section>
   <section>
     <div id="scene" data-min-icon-px="{min_icon_px}">
-      正在加载三维场景…(Three.js 场景随里程碑 9 交付,GAP-16)</div>
+      三维场景加载中…(需支持 WebGL;数据面板不受影响)</div>
     <h4>设备</h4><ul id="device-list"></ul>
   </section>
   <section id="alarm-hud"><h4>离线告警
     <span class="chip" id="alarm-count">0</span></h4></section>
 </main>
-<script>window.F3D_VER = "{version}";</script>
-<script>{_SCRIPT}</script>
+<script nonce="{nonce}">window.F3D_VER = "{version}";</script>
+<script nonce="{nonce}">{_SCRIPT}</script>
+<script type="module" src="/static/scene.js"></script>
 </body></html>"""

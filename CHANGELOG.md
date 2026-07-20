@@ -349,3 +349,57 @@ nvr 发现 6 条路由缺口与 3 个工件缺口,全部补齐。
 
 ### 验证
 全量 235 项测试通过;`ci_gate.sh` 四步全绿;契约 export+diff 零漂移。
+
+## 里程碑 9(2026-07-20)· 前端三形态(F1/F2/F3)+ ui-kit + 浏览器 E2E
+
+### 新增
+- **ui-kit 内部包**(`frontend/ui-kit`,H11 §一):CSS 设计变量(港口信号色系/
+  系统字体栈守 ARC-5/`[hidden]` E3 兜底)、统一 fetch 封装(CSRF 自动携带、
+  X-Request-Id 生成透传、401/403/423/429 四态分层文案含等待时长、AdapterResult
+  信封与 pydantic/field_errors 双源字段级错误解析、Bearer/form/urlencoded 载体)、
+  ~90 行自研 history 路由(零 react-router 依赖)、DEMO/生产成对横幅、
+  模式+密码套件徽标、手机号打码、schema 驱动同构设置页(env 锁定/来源层/
+  「恢复默认」=null 删除覆盖语义);纯函数经 node --experimental-strip-types
+  直载 TS 源测试(26 组断言)并挂入 unittest。
+- **F2 四 SPA**(React 18 + Vite + TS strict,构建产物入 `apps/<app>/web/dist`
+  随仓交付,后端 `rp_common/spa.py` 统一托管:/app + history 深链兜底 + CSP +
+  越界防护 + 产物缺失 503):
+  - quiz 六页:刷题(背题/做题双模式、单题/列表双视图、题型/底色双分类)、
+    错题本、进度+掌握度概览(R-QZ-2 邻域采样开关)、今日复习(R-QZ-1)、
+    迁移码双侧页(R-QZ-3)、登录(SSO 显隐依 /sso/status + 游客双入口);
+  - certvault 六页(JWT 仅存内存,刷新经 /auth/sso/exchange 恢复,401 自动
+    exchange 重试):证件库、发证(介质下拉+推荐理由可覆盖 R-CV-2、参数
+    面板、可手改拼接文字、「保存为默认」仅界面参数入 localStorage)、备案
+    台账(独立备案/撤销与作废标记 R-CV-5/48bit ID 用量)、溯源(置信等级+
+    投票明细+双引擎不一致告警样式 R-CV-3、engine_errors 明示 06-E7)、
+    管理、账户/2FA;
+  - nvr 七页:总览(本体/通道分离展示、「录像机在线」措辞 02-C1)、设备
+    详情(检测证据链展开 R-NVR-4、统一时间线、手动检测)、告警、周报
+    (降级原因徽标 R-NVR-3)、设置(ui-kit 设置页复用+渠道就绪度)、账户
+    (WebAuthn 依 GAP-25 不做占位)、登录;
+  - adapter 三页:运行状态(features/providers/M17 告警/最近事件)、死信
+    导出→修复→重放(R-AD-3)、接入文档;`/console` 保留为低依赖备用面。
+- **F3 三维大屏**(GAP-16 解除):`deploy/fetch_libs.sh` 预取 three@0.160.1
+  本地副本(ARC-5 禁 CDN,sha256 入库);`apps/factory3d/web/scene.js` 零
+  addons 自研轨道相机(拖拽环绕/滚轮距离/双击回 home)、低多边形程序化
+  成景(1 场区/4 栋/23 台)、WS 单连接帧事件转发驱动状态着色与离线脉冲环、
+  降级阶梯承接(full 开阴影→no_shadow→low_tex/low_push 降 pixelRatio,
+  R-F3D-1 端到端);大屏页转 per-response nonce CSP(禁 unsafe-inline)。
+- **F1 红线固化**:IdP 全站 HTML 安全头中间件——/admin* 零 JS CSP
+  (default-src 'none',script 全禁),其余页同源 CSP + nosniff + Referrer-Policy。
+- **I 组验收固化**:`scripts/check_frontend_e3.py`(E3 双条款,含反例自检)、
+  `scripts/scan_frontend_external.py`(承载性外链+黑名单域零命中)进 CI
+  第 5 步;`ci_gate.sh` 扩至六步(第 6 步 eslint+prettier,无 node 环境跳过);
+  `tests/test_i_frontend.py` 10 项 + `tests/e2e/test_e2e_frontend.py` 浏览器
+  4 项(横幅成对 05-D9、登录后 storage 零令牌、401 保留站内 next、CSP 下
+  scene canvas 装载 + fps 芯片刷新)。
+
+### 行为变化
+- quiz `GET /guest/load/{code}`:M3 占位升级——命中即设游客 Cookie 并返回
+  真实进度汇总(此前不落会话导致「输 ID 载入」无效);404 语义不变。
+- 各 RP `/healthz`:注入 SecurityProfile 后追加 `mode`/`crypto_suite` 两字段
+  (H11 §二横切徽标);未注入时响应与历史逐字节一致,既有断言零影响。
+- factory3d `/`(HTML 态):新增 CSP/nonce 响应头与 `/static/*` 静态路由;
+  `#scene` 占位文案更新;数据壳既有元素与 `window.F3D_VER` 注入不变。
+- IdP HTML 响应新增安全头(见上);登录页 CSP 不设 form-action(会拦截
+  表单提交后跨源 302 授权链,Chrome 语义),管理区保留全量严格头。

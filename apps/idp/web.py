@@ -114,6 +114,31 @@ def _restore_login_context(ctx: IdpContext, rid: str) -> tuple:
 def create_app(ctx: IdpContext) -> FastAPI:
     """@brief 组装 IdP FastAPI 应用(上下文注入,便于测试构造)"""
     app = FastAPI(title="港电统一认证中心", docs_url=None, redoc_url=None)
+
+    # ---- F1 安全头固化(H11 §一/§四.4,里程碑 9) ------------------------
+    #   /admin*:零 JS CSP(default-src 'none',脚本全禁);
+    #   其余 HTML:同源 CSP,仅放行登录页最小渐进增强内联脚本(F1 特许)。
+    _CSP_ADMIN = ("default-src 'none'; style-src 'unsafe-inline'; "
+                  "img-src 'self' data:; form-action 'self'; "
+                  "base-uri 'none'; frame-ancestors 'none'")
+    #   注:登录成功后 302 续接授权链跨源落回 RP,form-action 会拦截
+    #   表单提交后的重定向链(Chrome 语义),故页面级 CSP 不设 form-action。
+    _CSP_PAGE = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                 "style-src 'unsafe-inline'; img-src 'self' data:; "
+                 "base-uri 'self'; frame-ancestors 'self'")
+
+    @app.middleware("http")
+    async def f1_security_headers(request, call_next):
+        """@brief F1 页面安全头(HTML 响应统一附;/admin 零 JS 更严)"""
+        response = await call_next(request)
+        ctype = response.headers.get("content-type", "")
+        if "text/html" in ctype:
+            path = request.url.path
+            response.headers["Content-Security-Policy"] = (
+                _CSP_ADMIN if path.startswith("/admin") else _CSP_PAGE)
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["Referrer-Policy"] = "same-origin"
+        return response
     app.state.ctx = ctx
     app.include_router(build_admin_router(ctx))
 
