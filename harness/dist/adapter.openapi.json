@@ -1,0 +1,1243 @@
+{
+  "components": {
+    "schemas": {
+      "CleaningRobotCommandRequest": {
+        "description": "清洁机器人命令请求。",
+        "properties": {
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "robot_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Robot Id"
+          },
+          "scheduled_cleaning_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scheduled Cleaning At"
+          },
+          "scheduling_method": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scheduling Method"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          }
+        },
+        "title": "CleaningRobotCommandRequest",
+        "type": "object"
+      },
+      "CleaningRobotCommandResult": {
+        "description": "清洁机器人命令结果。",
+        "properties": {
+          "command": {
+            "title": "Command",
+            "type": "string"
+          },
+          "robot_id": {
+            "title": "Robot Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "vendor_payload": {
+            "additionalProperties": true,
+            "title": "Vendor Payload",
+            "type": "object"
+          }
+        },
+        "required": [
+          "robot_id",
+          "command",
+          "status"
+        ],
+        "title": "CleaningRobotCommandResult",
+        "type": "object"
+      },
+      "DeadLetterExport": {
+        "description": "GET /api/v1/deadletters/export 响应(13-R-AD-3:JSON Lines 导出)。",
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "jsonl": {
+            "default": "",
+            "title": "Jsonl",
+            "type": "string"
+          }
+        },
+        "required": [
+          "count"
+        ],
+        "title": "DeadLetterExport",
+        "type": "object"
+      },
+      "DeadLetterReplayRequest": {
+        "description": "POST /api/v1/deadletters/replay 请求(jsonl 缺省=重放当前死信队列)。",
+        "properties": {
+          "jsonl": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Jsonl"
+          }
+        },
+        "title": "DeadLetterReplayRequest",
+        "type": "object"
+      },
+      "DeadLetterReplayResult": {
+        "description": "死信重放结果(DedupeCache 协同:已投递的跳过,下游仍只见一次)。",
+        "properties": {
+          "enqueued": {
+            "title": "Enqueued",
+            "type": "integer"
+          },
+          "skipped": {
+            "title": "Skipped",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "enqueued",
+          "skipped"
+        ],
+        "title": "DeadLetterReplayResult",
+        "type": "object"
+      },
+      "DevicesSnapshot": {
+        "description": "GET /api/v1/status/devices 响应(真实+模拟合并,真实优先)。",
+        "properties": {
+          "devices": {
+            "items": {
+              "$ref": "#/components/schemas/UnifiedOsd"
+            },
+            "title": "Devices",
+            "type": "array"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "real_count": {
+            "title": "Real Count",
+            "type": "integer"
+          },
+          "simulated_count": {
+            "title": "Simulated Count",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "devices",
+          "real_count",
+          "simulated_count"
+        ],
+        "title": "DevicesSnapshot",
+        "type": "object"
+      },
+      "FeatureItem": {
+        "description": "feature 清单条目。",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "priority": {
+            "default": "",
+            "title": "Priority",
+            "type": "string"
+          },
+          "status": {
+            "default": "",
+            "title": "Status",
+            "type": "string"
+          },
+          "title": {
+            "default": "",
+            "title": "Title",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "title": "FeatureItem",
+        "type": "object"
+      },
+      "FeaturesStatus": {
+        "description": "GET /api/v1/status/features 响应。",
+        "properties": {
+          "features": {
+            "items": {
+              "$ref": "#/components/schemas/FeatureItem"
+            },
+            "title": "Features",
+            "type": "array"
+          }
+        },
+        "required": [
+          "features"
+        ],
+        "title": "FeaturesStatus",
+        "type": "object"
+      },
+      "FlightHubSyncAccepted": {
+        "description": "司空2 Sync 推送受理回执(feature 启用后)。",
+        "properties": {
+          "accepted": {
+            "default": 1,
+            "title": "Accepted",
+            "type": "integer"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_id"
+        ],
+        "title": "FlightHubSyncAccepted",
+        "type": "object"
+      },
+      "FlyCartCommandRequest": {
+        "description": "FlyCart 命令请求(device_sn 必填由 dispatch 校验)。",
+        "properties": {
+          "cmd": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cmd"
+          },
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command"
+          },
+          "device_sn": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Device Sn"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Status"
+          },
+          "task": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          }
+        },
+        "title": "FlyCartCommandRequest",
+        "type": "object"
+      },
+      "FlyCartCommandResult": {
+        "description": "FlyCart 命令结果。",
+        "properties": {
+          "bid": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bid"
+          },
+          "command": {
+            "title": "Command",
+            "type": "string"
+          },
+          "device_sn": {
+            "title": "Device Sn",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
+          },
+          "vendor_payload": {
+            "additionalProperties": true,
+            "title": "Vendor Payload",
+            "type": "object"
+          }
+        },
+        "required": [
+          "device_sn",
+          "command",
+          "status"
+        ],
+        "title": "FlyCartCommandResult",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "HealthzStatus": {
+        "description": "进程存活(仅存活,不含接线情况)。",
+        "properties": {
+          "status": {
+            "default": "ok",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "title": "HealthzStatus",
+        "type": "object"
+      },
+      "RecentEvents": {
+        "description": "GET /api/v1/events/recent 响应(newest-first)。",
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/UnifiedEventView"
+            },
+            "title": "Events",
+            "type": "array"
+          }
+        },
+        "required": [
+          "count",
+          "events"
+        ],
+        "title": "RecentEvents",
+        "type": "object"
+      },
+      "RuntimeStatus": {
+        "description": "GET /api/v1/status/runtime 响应(接线/队列/轮询/外发/原始报文)。",
+        "properties": {
+          "commands": {
+            "additionalProperties": true,
+            "title": "Commands",
+            "type": "object"
+          },
+          "env_warnings": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Env Warnings",
+            "type": "array"
+          },
+          "forwarder": {
+            "additionalProperties": true,
+            "title": "Forwarder",
+            "type": "object"
+          },
+          "poller_jobs": {
+            "items": {},
+            "title": "Poller Jobs",
+            "type": "array"
+          },
+          "providers": {
+            "additionalProperties": true,
+            "title": "Providers",
+            "type": "object"
+          },
+          "raw_log": {
+            "items": {},
+            "title": "Raw Log",
+            "type": "array"
+          },
+          "sink": {
+            "additionalProperties": true,
+            "title": "Sink",
+            "type": "object"
+          }
+        },
+        "required": [
+          "providers",
+          "sink",
+          "poller_jobs",
+          "forwarder",
+          "commands"
+        ],
+        "title": "RuntimeStatus",
+        "type": "object"
+      },
+      "SiyunWebhookAccepted": {
+        "description": "司运推送受理回执。",
+        "properties": {
+          "accepted": {
+            "default": 1,
+            "title": "Accepted",
+            "type": "integer"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "osd_updated": {
+            "default": false,
+            "title": "Osd Updated",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "event_id"
+        ],
+        "title": "SiyunWebhookAccepted",
+        "type": "object"
+      },
+      "UnifiedEventView": {
+        "description": "统一事件视图。",
+        "properties": {
+          "data": {
+            "additionalProperties": true,
+            "title": "Data",
+            "type": "object"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "event_type": {
+            "title": "Event Type",
+            "type": "string"
+          },
+          "severity": {
+            "default": "info",
+            "title": "Severity",
+            "type": "string"
+          },
+          "sn": {
+            "default": "",
+            "title": "Sn",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "ts": {
+            "default": "",
+            "title": "Ts",
+            "type": "string"
+          }
+        },
+        "required": [
+          "event_id",
+          "source",
+          "event_type"
+        ],
+        "title": "UnifiedEventView",
+        "type": "object"
+      },
+      "UnifiedOsd": {
+        "description": "统一遥测快照(北向契约,与 core.model.UnifiedOsd 字段一致)。",
+        "properties": {
+          "altitude": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Altitude"
+          },
+          "battery_percent": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Battery Percent"
+          },
+          "device_kind": {
+            "default": "unknown",
+            "title": "Device Kind",
+            "type": "string"
+          },
+          "extra": {
+            "additionalProperties": true,
+            "title": "Extra",
+            "type": "object"
+          },
+          "heading": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heading"
+          },
+          "latitude": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latitude"
+          },
+          "longitude": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Longitude"
+          },
+          "mode_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode Code"
+          },
+          "online": {
+            "default": false,
+            "title": "Online",
+            "type": "boolean"
+          },
+          "sn": {
+            "title": "Sn",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "speed": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speed"
+          },
+          "updated_at": {
+            "default": "",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sn",
+          "source"
+        ],
+        "title": "UnifiedOsd",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "XingluoCommandRequest": {
+        "description": "星逻命令请求(条件必填由 dispatch 校验→400)。",
+        "properties": {
+          "camera_lens": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Camera Lens"
+          },
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
+          "mission_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mission Id"
+          },
+          "site_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Site Id"
+          },
+          "uav_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Uav Id"
+          }
+        },
+        "title": "XingluoCommandRequest",
+        "type": "object"
+      },
+      "XingluoCommandResult": {
+        "description": "星逻命令结果(succeeded|accepted)。",
+        "properties": {
+          "command": {
+            "title": "Command",
+            "type": "string"
+          },
+          "mission_batch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mission Batch"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "uav_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Uav Id"
+          },
+          "vendor_payload": {
+            "additionalProperties": true,
+            "title": "Vendor Payload",
+            "type": "object"
+          }
+        },
+        "required": [
+          "command",
+          "status"
+        ],
+        "title": "XingluoCommandResult",
+        "type": "object"
+      },
+      "ZhiguangWebhookAccepted": {
+        "description": "织光推送受理回执。",
+        "properties": {
+          "accepted": {
+            "default": 1,
+            "title": "Accepted",
+            "type": "integer"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "string"
+          },
+          "signature_valid": {
+            "title": "Signature Valid",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "event_id",
+          "signature_valid"
+        ],
+        "title": "ZhiguangWebhookAccepted",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "Gd-港电 云云对接多平台适配器",
+    "version": "2.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/commands/cleaning-robot": {
+      "post": {
+        "description": "@brief 清洁机器人命令(ack 受理语义)",
+        "operationId": "commands_cleaning_robot",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CleaningRobotCommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CleaningRobotCommandResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Commands Cleaning Robot"
+      }
+    },
+    "/api/v1/commands/flycart": {
+      "post": {
+        "description": "@brief FlyCart 命令(bid 终态礼貌轮询)",
+        "operationId": "commands_flycart",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FlyCartCommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlyCartCommandResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Commands Flycart"
+      }
+    },
+    "/api/v1/commands/xingluo": {
+      "post": {
+        "description": "@brief 星逻无人机命令(takeoff 成功后登记批次续跟)",
+        "operationId": "commands_xingluo",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/XingluoCommandRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/XingluoCommandResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Commands Xingluo"
+      }
+    },
+    "/api/v1/deadletters/export": {
+      "get": {
+        "description": "@brief 13-R-AD-3:死信队列导出(JSON Lines,一行一事件)",
+        "operationId": "deadletters_export",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeadLetterExport"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Deadletters Export"
+      }
+    },
+    "/api/v1/deadletters/replay": {
+      "post": {
+        "description": "@brief 13-R-AD-3:死信重放(已投递的经 DedupeCache 跳过)",
+        "operationId": "deadletters_replay",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeadLetterReplayRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeadLetterReplayResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Deadletters Replay"
+      }
+    },
+    "/api/v1/events/recent": {
+      "get": {
+        "description": "@brief 旁路环形缓冲查询(钳制 1..容量,newest-first,不消费队列)",
+        "operationId": "events_recent",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "title": "Source",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "event_type",
+            "required": false,
+            "schema": {
+              "title": "Event Type",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecentEvents"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Events Recent"
+      }
+    },
+    "/api/v1/status/devices": {
+      "get": {
+        "description": "@brief 真实+模拟快照合并(真实优先);空时附 note",
+        "operationId": "status_devices",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DevicesSnapshot"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Status Devices"
+      }
+    },
+    "/api/v1/status/features": {
+      "get": {
+        "description": "@brief feature 清单视图",
+        "operationId": "status_features",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FeaturesStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Status Features"
+      }
+    },
+    "/api/v1/status/runtime": {
+      "get": {
+        "description": "@brief 接线状态 + sink 队列 + poller.jobs + 外发统计 + 原始报文",
+        "operationId": "status_runtime",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RuntimeStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Status Runtime"
+      }
+    },
+    "/api/v1/webhooks/flighthub-sync": {
+      "post": {
+        "description": "@brief 司空2 Sync(feature=planned→501;启用后通用信封保链路)",
+        "operationId": "webhook_flighthub_sync",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FlightHubSyncAccepted"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Webhook Flighthub Sync"
+      }
+    },
+    "/api/v1/webhooks/siyun": {
+      "post": {
+        "description": "@brief 司运推送(TD-022 验签;OSD 可选 + 事件分别 emit)",
+        "operationId": "webhook_siyun",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SiyunWebhookAccepted"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Webhook Siyun"
+      }
+    },
+    "/api/v1/webhooks/zhiguang": {
+      "post": {
+        "description": "@brief 织光推送(strict 失败 401 / log 只记 / off)",
+        "operationId": "webhook_zhiguang",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ZhiguangWebhookAccepted"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Webhook Zhiguang"
+      }
+    },
+    "/healthz": {
+      "get": {
+        "description": "@brief 仅进程存活;接线情况看 runtime",
+        "operationId": "healthz",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthzStatus"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Healthz"
+      }
+    }
+  }
+}

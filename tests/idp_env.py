@@ -1,0 +1,76 @@
+# -*- coding: utf-8 -*-
+"""
+@file    idp_env.py
+@brief   IdP 测试环境构造器:临时库+临时密钥目录+本地易失态,按模式构建应用;
+         同一目录重建即模拟"重启/多实例"(C08/C09 等价复现前提)。
+@author  港电实验室平台组
+@date    2026-07-18
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+"""
+import tempfile
+
+from tests.base import TEST_KEY_HEX
+
+from gd_storage import LocalVolatileStore
+from apps.idp.context import IdpContext
+from apps.idp.web import create_app
+from selfcheck.asgi import AsgiClient
+
+ADMIN_ACCOUNT = "op_admin"
+ADMIN_PASSWORD = "Adm1n!Passw0rd"
+USER_ACCOUNT = "alice"
+USER_PASSWORD = "Alice!Passw0rd9"
+TEST_IP = "10.0.0.1"
+
+
+class IdpEnv:
+    """一套可重启的 IdP 测试环境(db/keys/store 跨"重启"保持)。"""
+
+    def __init__(self, is_demo: bool = False):
+        """@brief 首次构建环境"""
+        self.db_path = tempfile.mktemp(suffix=".db")
+        self.key_dir = tempfile.mkdtemp(prefix="idp-keys-")
+        self.store = LocalVolatileStore()
+        self.is_demo = is_demo
+        self.ctx = None
+        self.restart()
+
+    def _environ(self) -> dict:
+        """@brief 组装环境变量(测试主密钥;DEMO 按需)"""
+        environ = {"MASTER_KEY_HEX": TEST_KEY_HEX, "MASTER_KEY_ID": "mk1"}
+        if self.is_demo:
+            environ["DEMO_MODE"] = "1"
+        return environ
+
+    def restart(self):
+        """@brief 重建应用(模拟进程重启:store/db/keys 持久,进程对象全新)"""
+        if self.ctx is not None:
+            self.ctx.close()
+        self.ctx = IdpContext(f"sqlite:///{self.db_path}", self.key_dir,
+                              store=self.store, environ=self._environ())
+        self.app = create_app(self.ctx)
+        return self
+
+    def client(self) -> AsgiClient:
+        """@brief 新建独立 Cookie 罐的客户端"""
+        return AsgiClient(self.app)
+
+    def seed_admin_and_user(self):
+        """@brief 播种一名管理员与一名普通用户(不触发首登强改)"""
+        self.ctx.accounts.create_user(ADMIN_ACCOUNT, "运维管理员", ADMIN_PASSWORD,
+                                      self.ctx.profile, "system", TEST_IP,
+                                      is_admin=True, force_change=False)
+        self.ctx.accounts.create_user(USER_ACCOUNT, "张三", USER_PASSWORD,
+                                      self.ctx.profile, "system", TEST_IP,
+                                      force_change=False)
+
+    def login(self, client: AsgiClient, account: str, password: str,
+              extra: dict = None):
+        """@brief 表单登录并返回响应(Cookie 落客户端)"""
+        data = {"account": account, "password": password}
+        data.update(extra or {})
+        return client.post("/login", data=data)
+
+    def close(self):
+        """@brief 释放资源"""
+        self.ctx.close()

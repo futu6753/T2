@@ -1,0 +1,38 @@
+# 星逻驭光(无人机机库)映射声明(13-R-AD-1 契约工件,入 diff 防漂移流水线)
+# reply 语义参数(原 R-AD-2)并入本声明:ack 超时/轮询间隔/句柄候选/终态谓词
+vendor: skysys
+source: skysys
+device_kind: uav
+osd:
+events:
+  - name: mission_batch
+    when:
+      path: missionBatch
+      exists: true
+    event_id: "skysys:batch:{missionBatch}:{status}"
+    event_type:
+      default: mission_batch
+    severity:
+      path: status
+      enum:
+        "4": warn
+        failed: warn
+      default: info
+    sn:
+      path: uavId
+    ts:
+      path: time
+reply:
+  ack_timeout_s: 30
+  poll_interval_s: 2
+  handle:
+    candidates: "data.missionBatch,missionBatch,data.batchId,batchId"
+  terminal:
+    query: batch_status
+    path: "data.status"
+    succeeded:
+      - 3
+      - finished
+    failed:
+      - 4
+      - failed

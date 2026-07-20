@@ -1,0 +1,78 @@
+# 大疆司运(FlyCart 运载)映射声明(13-R-AD-1 契约工件,入 diff 防漂移流水线)
+# 单位换算示例:battery 0..1 → 百分比(scale 100);height 分米 → 米(scale 0.1)
+vendor: siyun
+source: siyun
+device_kind: flycart
+osd:
+  sn:
+    path: deviceSn
+  online:
+    path: online
+    default: false
+  battery_percent:
+    path: battery
+    scale: 100
+    round: 1
+  longitude:
+    path: lng
+    round: 6
+  latitude:
+    path: lat
+    round: 6
+  altitude:
+    path: height
+    scale: 0.1
+    round: 1
+  speed:
+    path: speed
+  heading:
+    path: heading
+  mode_code:
+    path: mode
+  updated_at:
+    path: updateTime
+events:
+  - name: push
+    when:
+      path: event_type
+      exists: true
+    event_id: "siyun:{event_type}:{sub_type}:{id}"
+    event_type:
+      path: event_type
+    severity:
+      path: severity
+      default: info
+    sn:
+      path: deviceSn
+    ts:
+      path: time
+  - name: task
+    when:
+      path: taskId
+      exists: true
+    event_id: "siyun:task:{taskId}:{status}"
+    event_type:
+      default: flycart_task
+    severity:
+      path: severity_hint
+      enum:
+        warn: warn
+      default: info
+    sn:
+      path: deviceSn
+    ts:
+      path: time
+reply:
+  ack_timeout_s: 30
+  poll_interval_s: 2
+  handle:
+    candidates: "data.bid,bid"
+  terminal:
+    query: cmd_status
+    path: "data.status"
+    succeeded:
+      - ok
+      - succeeded
+    failed:
+      - failed
+      - rejected

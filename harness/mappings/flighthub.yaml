@@ -1,0 +1,24 @@
+# 司空2 / FlightHub Sync 通用信封映射(13-R-AD-1 契约工件)
+# feature=planned:启用后走通用信封链路,专用翻译器随 GAP-24 落地
+vendor: flighthub
+source: flighthub
+device_kind: dock
+osd:
+events:
+  - name: sync_envelope
+    when:
+      path: id
+      exists: true
+    event_id: "flighthub:sync:{id}"
+    event_type:
+      path: event_type
+      default: sync_event
+    severity:
+      default: info
+    sn:
+      path: deviceSn
+    ts:
+      path: time
+reply:
+  ack_timeout_s: 30
+  poll_interval_s: 2

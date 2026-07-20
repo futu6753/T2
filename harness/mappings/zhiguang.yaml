@@ -1,0 +1,62 @@
+# 织光(光伏清洁机器人)映射声明(13-R-AD-1 契约工件,入 diff 防漂移流水线)
+# 语法为 yamlite 受限子集:两空格缩进/整行注释/无行内注释
+vendor: zhiguang
+source: zhiguang
+device_kind: cleaning_robot
+osd:
+  sn:
+    path: robotSn
+  online:
+    path: onlineState
+    enum:
+      "1": true
+      "0": false
+    default: false
+  battery_percent:
+    path: battery
+  longitude:
+    path: pos.lng
+    round: 6
+  latitude:
+    path: pos.lat
+    round: 6
+  mode_code:
+    path: workMode
+  updated_at:
+    path: reportTime
+events:
+  - name: alarm
+    when:
+      path: id
+      exists: true
+    event_id: "zhiguang:alarm:{id}:{status}"
+    event_type:
+      path: alarmType
+      default: alarm
+    severity:
+      path: level
+      enum:
+        "1": info
+        "2": warn
+        "3": critical
+      default: warn
+    sn:
+      path: robotSn
+    ts:
+      path: time
+  - name: cleaning_task
+    when:
+      path: taskId
+      exists: true
+    event_id: "zhiguang:task:{taskId}:{taskState}"
+    event_type:
+      default: cleaning_task
+    severity:
+      default: info
+    sn:
+      path: robotSn
+    ts:
+      path: time
+reply:
+  ack_timeout_s: 30
+  poll_interval_s: 2

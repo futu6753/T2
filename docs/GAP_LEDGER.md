@@ -1,0 +1,30 @@
+# GAP 台账(H06-E17 工程红线:未完成必打 TODO(GAP-xx) 入台账,只增不删)
+
+> 台账为只增文件:历史条目不删除,解除时更新"状态"列并记录解除依据(测试锚点)。
+
+| 编号 | 内容 | 位置 | 解除条件 | 状态 |
+|---|---|---|---|---|
+| GAP-01 | 国密套件 gm 为占位实现,调用抛明确错误,禁止静默降级 | `gd_crypto/suites.py` GmSuiteStub;`gd_sso_client/jwt_verify.py` SM2 验签 | 目标环境接入国密 Provider 后替换,并跑 H09-F gm 冒烟 | 未解除 |
+| GAP-02 | 自检 DSL 中 D4/D5 为 http 级断言,待 IdP 端点落地后转强制 | `selfcheck/demo_items.yaml` | 里程碑 2 IdP 上线,注册 http 检查函数并删除 pending 字段 | **已解除(里程碑 2)**:`selfcheck/registry.py` HTTP_CHECKS + 进程内 ASGI 执行;回归 `test_r_idp3_http_assertions_demo_and_prod` |
+| GAP-03 | PostgreSQL 全量测试未在本环境执行(无 PG 服务) | `ci_gate.sh` 提供 GD_TEST_PG_URL 一键入口 | 目标环境设 GD_TEST_PG_URL 后跑双库同测(H09-J.1) | 未解除 |
+| GAP-04 | Redis 集成测试未在本环境执行(无 Redis 服务);fail-closed 语义已有 mock 级活体测试 | `tests/test_audit_storage.py` | 目标环境起 Redis 后跑跨实例累加/宕机 fail-closed(H09-J.4) | 未解除 |
+| GAP-05 | ISsoClient 为接口定义,空实现 | `gd_sso_client/__init__.py` | 里程碑 2 交付实现 + 继承 nvr test_sso 8 用例语义(H06-E13) | **已解除(里程碑 2)**:`gd_sso_client/client.py`;回归 `tests/test_c_sso_client.py`(7 用例) |
+| GAP-06 | 审计留存清理(整段归档导出→删除最旧段→重锚)未实现 | 里程碑排期 | 实现后补跨档校验测试(H09-J.2) | 未解除(移交里程碑 8 运维线) |
+| GAP-07 | DEMO 态每小时审计心跳依赖应用生命周期调度器 | `scripts/run_idp.py` | 实现后补存活性测试(H07 L1-12) | **部分解除(里程碑 2)**:心跳任务已挂 `run_idp.py` 事件循环;存活性测试待里程碑 8 部署联测补 |
+| GAP-08 | 短信登录生产形态未接正规服务商 Provider(当前仅验证码引擎+DEMO 回显闭环) | `apps/idp/accounts.py` send_sms_code | 业主签约服务商后接 Provider(ARC-3 可插拔),补投递失败降级测试 | 未解除 |
+| GAP-09 | mTLS 数字证书登录生产形态(网关透传客户端证书指纹比对)与微信真实开放平台流程未实现;DEMO 侧 D4/D5 模拟入口已闭环 | `apps/idp/web.py` /login/cert-demo、/wx/scan | 目标环境配 TLS 终止网关 + WECHAT_APPID/SECRET 后落生产链路(02-A2.4/5) | 未解除 |
+| GAP-10 | WebAuthn 安全密钥登录未实现(fido2 依赖已入 wheels) | 里程碑排期(method_webauthn 暂未入 schema) | 实现注册/断言流程与账户页自助管理(H03 §4) | 未解除 |
+| GAP-11 | /me/export、/me/delete-request 个人信息权利接口与 admin_networks 网段中间件、登录限速(rate_multiplier 应用层)未实现 | 里程碑 4 排期(网关侧限速已入 deploy/nginx.conf 参考配置) | 实现后补 PIPL 权利接口测试与网段拦截测试(H04 §七 / H03 §5);06-E13 回归清单中"网段限制"用例随之补 | 未解除 |
+| GAP-12 | R-IDP-2 套件在线迁移脚本 migrate_crypto_suite(双写窗口+断点续迁+审计锚点)与 R-IDP-4 登录方式健康度看板未实现 | 里程碑 10 排期(与国密 Provider 同批) | 交付脚本+看板并挂 H09 §二 K 对应测试 | 未解除 |
+| GAP-13 | stega(StegaStamp ONNX 约209MB)/tm(TrustMark)模型权重与 aliyun SDK 离线环境不可得:引擎骨架+可用性探测已实现(/engines、/health 如实上报「模型未安装」,/issue 选中 → 400 人话拒绝=契约内合法状态);盲提顺序、组合双保险、故障隔离、推荐器均以可注入引擎接口验证 | 目标环境将权重放入 STEGA_MODEL_DIR/TM_MODEL_DIR、配置 ALIYUN AK 后,在 apps/certvault/wm/engines.py 的 ModelDrivenEngineStub/AliyunEngineStub 挂接推理与 SDK | 挂接后跑 L02 §8 双后端互操作与 tm 逐位对齐验收;benchmarks/ 两脚本(erasure_benchmark --lama-dir、recapture_matrix)复测对照基线 | 未解除 |
+| GAP-14 | 海康 ISAPI 真设备探针(Digest 优先/401 回退一次 Basic/三通道端点兜底)离线环境无真设备无法联调:判定树/状态机/告警/巡检以可注入探针接口全量验证,生产默认工厂在未注入时明确报「ISAPI 探针未配置」 | 目标环境在 apps/nvr/web.py NvrContext._default_checker_factory 挂接标准库 http.client Digest 实现(或注入 checker_factory),配置 NVRM_MONITOR__* | 真机跑判定树五分支 + 通道发现三端点(InputProxy/channels/status → InputProxy/channels → System/Video/inputs/channels)+ checker CLI 验收(L04 §3) | 未解除 |
+| GAP-15 | Playwright/Chromium 浏览器为 E2E 依赖,离线目标环境若未预装则 `tests/e2e/*` 自动跳过(skipUnless),不阻塞门禁 | `tests/e2e/test_e2e_idp.py`、`tests/e2e/test_e2e_f3d.py` | 目标环境 `pip install playwright && playwright install chromium`(或离线包内置浏览器二进制)后 11 项浏览器用例全跑 | 未解除(基座已交付,浏览器随环境) |
+| GAP-16 | 三维场景本体(Three.js 渲染:楼宇网格/图钉/双层视角/编辑拖拽视图层)按里程碑计划归属里程碑 9 前端三形态;M6 已交付 `/` 数据壳大屏(安灯/KPI/事件流/告警 HUD/档位芯片/WS 客户端+fps 回报)与全部数据面契约,`#scene` 留占位 | `apps/factory3d/page.py` | 里程碑 9 以 Three.js 填充 #scene(off-line 包 three@r128),复用既有 WS 帧与 min_icon_px/tier 语义 | 部分解除(数据壳+契约面已交付) |
+| GAP-17 | F3D 三项生产形态未在离线环境落地:① MQTT 桥接(f3d_connection_mode=mqtt,需 paho-mqtt 与真实 Broker)② GLB 楼宇模型上传/绑定的真实文件管线(表 f3d_models 已建,上传路由留 M9 与前端同批)③ AI 助手真实 LLM 通道(现以"模型回复文本"注入口 preview/execute 全链验证,B7 评测 50 条零误执行) | `apps/factory3d/simulator.py`、`apps/factory3d/web_data.py`、`apps/factory3d/assistant.py` | 目标环境装 paho-mqtt 配 Broker;M9 交付模型上传;配置 ANTHROPIC_API_KEY 后挂真实对话流(动作协议不变) | 未解除 |
+| GAP-18 | certvault `test_k_combo_double_hit_consistent_high` 存在既有概率性抖动(双水印组合置信度边界),隔离重跑稳定通过;非 M6 引入 | `tests/test_k_certvault_wm.py` | 建议后续以固定种子/放宽边界带消抖(不改判定语义) | 未解除(记录在案) |
+| GAP-19 | 84 张配图素材文件(assets/q*.png)离线环境不可得:题库以路径引用交付,API 契约(image 字段/看图识隐患判分)完整可测 | `apps/quiz/bank.py` | 业主提供实拍/绘制素材放入静态目录即生效(路径规则 assets/q{qno:03d}.png),无代码改动 | 未解除 |
+| GAP-20 | quiz Web 界面层(单题/列表双视图切换、今日复习入口等交互形态)随里程碑 9 前端三形态统一交付;M7 已交付全部数据面 API(14 条路由)与双模式语义 | `apps/quiz/web.py` | 里程碑 9 按 11_前端规约 落界面,复用既有 API 无缝对接 | 部分解除(数据面已交付) |
+| GAP-21 | 织光签名算法细节为文档化假设(hmac_v1 = HMAC-SHA256(app_secret, 原始 body 字节)hex),真实厂商算法待联调核对;验签三模式(strict/log/off)与出入站共用同一落点 | `apps/adapter/core/vendors/zhiguang.py` ZhiguangSigner._digest;`config.py` ZG_SIGN_MODE | 联调拿到织光真实签名规范后仅改 _digest 一处,回归 `test_zhiguang_signer_modes` 与 webhook 三态用例 | 未解除 |
+| GAP-22 | 司运(大疆运维)请求侧鉴权头真实形态未知:SIYUN_AK_HEADER / AUTH_HEADER=Authorization / AUTH_VALUE 三兜底并存,403/200003 报错文案自带三项配置提示 | `apps/adapter/core/vendors/siyun.py` _headers;`config.py` SIYUN_* | 联调确认真实头形态后收敛配置并补真机冒烟;TD-022 推送验签公式已按文档逐字实现(`test_siyun_td022_formula`) | 未解除 |
+| GAP-23 | 星逻骥光 token 请求头名(默认 accessToken 可配)与业务响应批次字段名不确定:missionBatch/mission_batch/batchId/batch_id 四候选解析,缺失显式报错不猜 | `apps/adapter/core/vendors/skysys.py` _headers/_extract_batch;`config.py` SKYSYS_TOKEN_HEADER | 联调核对网关 B 真实头名与响应结构后收敛;回归 `test_skysys_token_ttl_and_batch_parse` | 未解除 |
+| GAP-24 | 大疆司空 2 / FlightHub Sync 鉴权、信封与推送体结构未定:feature=flighthub_sync 默认 planned→501 人话拒绝,临时启用后走通用信封链路(raw_log+成型事件)保链路不断;专用翻译器与验签器待厂商资料 | `apps/adapter/core/vendors/flighthub.py`;`harness/mappings/flighthub.yaml`;`feature_list.json` | 拿到司空 2 OpenAPI/推送文档后落专用映射与验签,feature 转 enabled,回归 `test_flighthub_planned_501_then_enabled_200` | 未解除 |

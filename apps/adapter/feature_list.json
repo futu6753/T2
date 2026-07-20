@@ -1,0 +1,62 @@
+[
+  {
+    "id": "ingest_zhiguang",
+    "title": "织光南向轮询采集",
+    "priority": "P0",
+    "status": "enabled"
+  },
+  {
+    "id": "ingest_skysys",
+    "title": "星逻在飞批次轮询",
+    "priority": "P0",
+    "status": "enabled"
+  },
+  {
+    "id": "ingest_siyun",
+    "title": "司运物模型/任务轮询",
+    "priority": "P0",
+    "status": "enabled"
+  },
+  {
+    "id": "webhook_zhiguang",
+    "title": "织光入站推送",
+    "priority": "P0",
+    "status": "enabled"
+  },
+  {
+    "id": "webhook_siyun",
+    "title": "司运入站推送",
+    "priority": "P0",
+    "status": "enabled"
+  },
+  {
+    "id": "commands_xingluo",
+    "title": "星逻无人机命令下行",
+    "priority": "P0",
+    "status": "enabled"
+  },
+  {
+    "id": "commands_flycart",
+    "title": "FlyCart 命令下行",
+    "priority": "P0",
+    "status": "enabled"
+  },
+  {
+    "id": "commands_cleaning_robot",
+    "title": "清洁机器人命令下行",
+    "priority": "P0",
+    "status": "enabled"
+  },
+  {
+    "id": "forwarder",
+    "title": "下游 Webhook 外发",
+    "priority": "P1",
+    "status": "enabled"
+  },
+  {
+    "id": "flighthub_sync",
+    "title": "司空2 Sync 推送(规划中)",
+    "priority": "P2",
+    "status": "planned"
+  }
+]

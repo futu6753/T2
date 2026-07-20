@@ -1,0 +1,60 @@
+# 港电统一平台 · 多实例参考拓扑(09 §二 G / 06-E13)
+# 2×IdP + 2×certvault + Redis + PostgreSQL + nginx(无 sticky session)。
+# 验收:登录五方式/SSO 全流程/back-channel 扇出在跨实例请求下全通;
+#       杀任一实例会话不丢;锁定计数跨实例累加;审计链并发写入无分叉。
+# 说明:本文件为参考工件;镜像构建随里程碑 10 部署包交付。
+# Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+
+services:
+  postgres:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: gangdian
+      POSTGRES_USER: gd
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?必须显式提供}
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes: ["redisdata:/data"]
+
+  idp-1: &idp
+    build: .
+    command: python scripts/run_idp.py --host 0.0.0.0 --port 9000
+    environment: &idp_env
+      DATABASE_URL: postgresql://gd:${PG_PASSWORD}@postgres/gangdian
+      REDIS_URL: redis://redis:6379/0
+      MASTER_KEY_HEX: ${MASTER_KEY_HEX:?生产必须注入}
+      MASTER_KEY_ID: ${MASTER_KEY_ID:-mk1}
+      IDP_KEY_DIR: /data/keys          # 共享卷:两实例同一 RSA 私钥 → kid 恒定
+    volumes: ["idpkeys:/data/keys"]
+    depends_on: [postgres, redis]
+
+  idp-2:
+    <<: *idp
+
+  certvault-1: &certvault
+    build: .
+    command: python scripts/run_certvault.py --host 0.0.0.0 --port 9100
+    environment:
+      <<: *idp_env
+      SSO_ISSUER: https://sso.gangdian.internal
+      SSO_CLIENT_ID: certvault
+      SSO_CLIENT_SECRET: ${CV_SSO_SECRET:?}
+      SSO_REDIRECT: https://cv.gangdian.internal/sso/callback
+    depends_on: [postgres, redis]
+
+  certvault-2:
+    <<: *certvault
+
+  nginx:
+    image: nginx:1.25
+    volumes: ["./deploy/nginx.conf:/etc/nginx/nginx.conf:ro"]
+    ports: ["443:443"]
+    depends_on: [idp-1, idp-2, certvault-1, certvault-2]
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  idpkeys: {}

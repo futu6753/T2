@@ -1,0 +1,50 @@
+# 曜阳储能(模拟第五家厂商,13-R-AD-4 / B9 接入成本基准标准任务)
+# 本文件即"接一家新厂商"的全部业务侧改动:写映射 + 验签器,引擎零改动
+vendor: yaoyang
+source: yaoyang
+device_kind: unknown
+osd:
+  sn:
+    path: cabinetSn
+  online:
+    path: comm
+    enum:
+      "1": true
+      "0": false
+    default: false
+  battery_percent:
+    path: soc
+    scale: 100
+    round: 1
+  longitude:
+    path: lon
+    round: 6
+  latitude:
+    path: lat
+    round: 6
+  mode_code:
+    path: mode
+  updated_at:
+    path: ts
+events:
+  - name: alarm
+    when:
+      path: alarmId
+      exists: true
+    event_id: "yaoyang:alarm:{alarmId}:{state}"
+    event_type:
+      default: energy_alarm
+    severity:
+      path: level
+      enum:
+        "1": info
+        "2": warn
+        "3": critical
+      default: warn
+    sn:
+      path: cabinetSn
+    ts:
+      path: ts
+reply:
+  ack_timeout_s: 30
+  poll_interval_s: 2

@@ -1,0 +1,354 @@
+{
+  "flighthub.yaml": {
+    "device_kind": "dock",
+    "events": [
+      {
+        "event_id": "flighthub:sync:{id}",
+        "event_type": {
+          "default": "sync_event",
+          "path": "event_type"
+        },
+        "name": "sync_envelope",
+        "severity": {
+          "default": "info"
+        },
+        "sn": {
+          "path": "deviceSn"
+        },
+        "ts": {
+          "path": "time"
+        },
+        "when": {
+          "exists": true,
+          "path": "id"
+        }
+      }
+    ],
+    "osd": null,
+    "reply": {
+      "ack_timeout_s": 30,
+      "poll_interval_s": 2
+    },
+    "source": "flighthub",
+    "vendor": "flighthub"
+  },
+  "siyun.yaml": {
+    "device_kind": "flycart",
+    "events": [
+      {
+        "event_id": "siyun:{event_type}:{sub_type}:{id}",
+        "event_type": {
+          "path": "event_type"
+        },
+        "name": "push",
+        "severity": {
+          "default": "info",
+          "path": "severity"
+        },
+        "sn": {
+          "path": "deviceSn"
+        },
+        "ts": {
+          "path": "time"
+        },
+        "when": {
+          "exists": true,
+          "path": "event_type"
+        }
+      },
+      {
+        "event_id": "siyun:task:{taskId}:{status}",
+        "event_type": {
+          "default": "flycart_task"
+        },
+        "name": "task",
+        "severity": {
+          "default": "info",
+          "enum": {
+            "warn": "warn"
+          },
+          "path": "severity_hint"
+        },
+        "sn": {
+          "path": "deviceSn"
+        },
+        "ts": {
+          "path": "time"
+        },
+        "when": {
+          "exists": true,
+          "path": "taskId"
+        }
+      }
+    ],
+    "osd": {
+      "altitude": {
+        "path": "height",
+        "round": 1,
+        "scale": 0.1
+      },
+      "battery_percent": {
+        "path": "battery",
+        "round": 1,
+        "scale": 100
+      },
+      "heading": {
+        "path": "heading"
+      },
+      "latitude": {
+        "path": "lat",
+        "round": 6
+      },
+      "longitude": {
+        "path": "lng",
+        "round": 6
+      },
+      "mode_code": {
+        "path": "mode"
+      },
+      "online": {
+        "default": false,
+        "path": "online"
+      },
+      "sn": {
+        "path": "deviceSn"
+      },
+      "speed": {
+        "path": "speed"
+      },
+      "updated_at": {
+        "path": "updateTime"
+      }
+    },
+    "reply": {
+      "ack_timeout_s": 30,
+      "handle": {
+        "candidates": "data.bid,bid"
+      },
+      "poll_interval_s": 2,
+      "terminal": {
+        "failed": [
+          "failed",
+          "rejected"
+        ],
+        "path": "data.status",
+        "query": "cmd_status",
+        "succeeded": [
+          "ok",
+          "succeeded"
+        ]
+      }
+    },
+    "source": "siyun",
+    "vendor": "siyun"
+  },
+  "skysys.yaml": {
+    "device_kind": "uav",
+    "events": [
+      {
+        "event_id": "skysys:batch:{missionBatch}:{status}",
+        "event_type": {
+          "default": "mission_batch"
+        },
+        "name": "mission_batch",
+        "severity": {
+          "default": "info",
+          "enum": {
+            "4": "warn",
+            "failed": "warn"
+          },
+          "path": "status"
+        },
+        "sn": {
+          "path": "uavId"
+        },
+        "ts": {
+          "path": "time"
+        },
+        "when": {
+          "exists": true,
+          "path": "missionBatch"
+        }
+      }
+    ],
+    "osd": null,
+    "reply": {
+      "ack_timeout_s": 30,
+      "handle": {
+        "candidates": "data.missionBatch,missionBatch,data.batchId,batchId"
+      },
+      "poll_interval_s": 2,
+      "terminal": {
+        "failed": [
+          4,
+          "failed"
+        ],
+        "path": "data.status",
+        "query": "batch_status",
+        "succeeded": [
+          3,
+          "finished"
+        ]
+      }
+    },
+    "source": "skysys",
+    "vendor": "skysys"
+  },
+  "yaoyang.yaml": {
+    "device_kind": "unknown",
+    "events": [
+      {
+        "event_id": "yaoyang:alarm:{alarmId}:{state}",
+        "event_type": {
+          "default": "energy_alarm"
+        },
+        "name": "alarm",
+        "severity": {
+          "default": "warn",
+          "enum": {
+            "1": "info",
+            "2": "warn",
+            "3": "critical"
+          },
+          "path": "level"
+        },
+        "sn": {
+          "path": "cabinetSn"
+        },
+        "ts": {
+          "path": "ts"
+        },
+        "when": {
+          "exists": true,
+          "path": "alarmId"
+        }
+      }
+    ],
+    "osd": {
+      "battery_percent": {
+        "path": "soc",
+        "round": 1,
+        "scale": 100
+      },
+      "latitude": {
+        "path": "lat",
+        "round": 6
+      },
+      "longitude": {
+        "path": "lon",
+        "round": 6
+      },
+      "mode_code": {
+        "path": "mode"
+      },
+      "online": {
+        "default": false,
+        "enum": {
+          "0": false,
+          "1": true
+        },
+        "path": "comm"
+      },
+      "sn": {
+        "path": "cabinetSn"
+      },
+      "updated_at": {
+        "path": "ts"
+      }
+    },
+    "reply": {
+      "ack_timeout_s": 30,
+      "poll_interval_s": 2
+    },
+    "source": "yaoyang",
+    "vendor": "yaoyang"
+  },
+  "zhiguang.yaml": {
+    "device_kind": "cleaning_robot",
+    "events": [
+      {
+        "event_id": "zhiguang:alarm:{id}:{status}",
+        "event_type": {
+          "default": "alarm",
+          "path": "alarmType"
+        },
+        "name": "alarm",
+        "severity": {
+          "default": "warn",
+          "enum": {
+            "1": "info",
+            "2": "warn",
+            "3": "critical"
+          },
+          "path": "level"
+        },
+        "sn": {
+          "path": "robotSn"
+        },
+        "ts": {
+          "path": "time"
+        },
+        "when": {
+          "exists": true,
+          "path": "id"
+        }
+      },
+      {
+        "event_id": "zhiguang:task:{taskId}:{taskState}",
+        "event_type": {
+          "default": "cleaning_task"
+        },
+        "name": "cleaning_task",
+        "severity": {
+          "default": "info"
+        },
+        "sn": {
+          "path": "robotSn"
+        },
+        "ts": {
+          "path": "time"
+        },
+        "when": {
+          "exists": true,
+          "path": "taskId"
+        }
+      }
+    ],
+    "osd": {
+      "battery_percent": {
+        "path": "battery"
+      },
+      "latitude": {
+        "path": "pos.lat",
+        "round": 6
+      },
+      "longitude": {
+        "path": "pos.lng",
+        "round": 6
+      },
+      "mode_code": {
+        "path": "workMode"
+      },
+      "online": {
+        "default": false,
+        "enum": {
+          "0": false,
+          "1": true
+        },
+        "path": "onlineState"
+      },
+      "sn": {
+        "path": "robotSn"
+      },
+      "updated_at": {
+        "path": "reportTime"
+      }
+    },
+    "reply": {
+      "ack_timeout_s": 30,
+      "poll_interval_s": 2
+    },
+    "source": "zhiguang",
+    "vendor": "zhiguang"
+  }
+}

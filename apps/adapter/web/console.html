@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<!--
+@file    console.html
+@brief   适配器运维控制台(L01 §6 逐元素规格):单文件、零外链内联;
+         顶栏健康圆点/自动刷新/立即刷新/X-Request-Id 灰字;设备遥测快照
+         (电量条形图/来源 chip);最近事件(过滤+着色);命令下发三 Tab
+         (idempotency_key 生成/结果面板);运行时(env-warn 黄条/轮询
+         任务表);Features 表。所有动态文本经 esc() 转义。
+Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>港电适配器 · 运维控制台</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --line:#334155; --text:#e2e8f0;
+          --dim:#94a3b8; --ok:#22c55e; --warn:#eab308; --bad:#ef4444;
+          --accent:#38bdf8; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.6 "Microsoft YaHei",system-ui,sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:10px 16px;
+           background:var(--card); border-bottom:1px solid var(--line);
+           position:sticky; top:0; flex-wrap:wrap; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--dim); }
+  .dot.ok { background:var(--ok); } .dot.bad { background:var(--bad); }
+  header .rid { margin-left:auto; color:var(--dim); font-size:12px; }
+  main { padding:16px; display:grid; gap:16px; }
+  section { background:var(--card); border:1px solid var(--line);
+            border-radius:8px; padding:12px 14px; }
+  h2 { margin:0 0 8px; font-size:15px; color:var(--accent); }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:4px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:normal; }
+  .meta { color:var(--dim); font-size:12px; margin-bottom:6px; }
+  .chip { display:inline-block; padding:0 8px; border-radius:10px;
+          font-size:12px; color:#0f172a; background:var(--dim); }
+  .src-zhiguang { background:#86efac; } .src-skysys { background:#93c5fd; }
+  .src-siyun { background:#fcd34d; } .src-flighthub { background:#c4b5fd; }
+  .src-simulator { background:#f9a8d4; }
+  .bar { display:inline-block; width:70px; height:8px; background:#0b1222;
+         border-radius:4px; overflow:hidden; vertical-align:middle; }
+  .bar i { display:block; height:100%; background:var(--ok); }
+  .bar.low i { background:var(--bad); }
+  .sev-critical { color:var(--bad); } .sev-warn { color:var(--warn); }
+  .sev-info { color:var(--text); }
+  .tabs { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+  .tabs button { background:#0b1222; color:var(--text); border:1px solid
+                 var(--line); border-radius:6px; padding:6px 12px; cursor:pointer; }
+  .tabs button.active { border-color:var(--accent); color:var(--accent); }
+  form { display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr));
+         gap:8px; }
+  form label { display:flex; flex-direction:column; font-size:12px;
+               color:var(--dim); gap:2px; }
+  input,select,textarea,button { background:#0b1222; color:var(--text);
+    border:1px solid var(--line); border-radius:6px; padding:6px 8px;
+    font:inherit; }
+  textarea { min-height:64px; grid-column:1 / -1; font-family:monospace; }
+  .row { display:flex; gap:6px; align-items:end; }
+  .submit { grid-column:1 / -1; background:#0c4a6e; border-color:var(--accent);
+            cursor:pointer; }
+  .panel { margin-top:10px; font-size:12px; }
+  .panel .summary { color:var(--dim); }
+  .pill { display:inline-block; padding:0 8px; border-radius:10px;
+          font-size:12px; background:var(--dim); color:#0f172a; }
+  .pill.ok { background:var(--ok); } .pill.bad { background:var(--bad); }
+  pre { background:#0b1222; border:1px solid var(--line); border-radius:6px;
+        padding:8px; overflow:auto; max-height:260px; font-size:12px; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 12px;
+        font-size:13px; }
+  .kv b { color:var(--dim); font-weight:normal; }
+  .env-warn { background:#422006; border:1px solid var(--warn);
+              color:#fde68a; border-radius:6px; padding:6px 10px;
+              margin-bottom:8px; font-size:13px; }
+  .filters { display:flex; gap:8px; margin-bottom:8px; flex-wrap:wrap; }
+  [hidden] { display:none; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="health-dot"></span>
+  <span id="health-text">探测中…</span>
+  <label><input type="checkbox" id="auto-refresh" checked> 自动刷新</label>
+  <select id="refresh-interval">
+    <option value="3000">3s</option>
+    <option value="5000" selected>5s</option>
+    <option value="10000">10s</option>
+  </select>
+  <button id="refresh-now">立即刷新</button>
+  <span class="rid">X-Request-Id: <span id="last-rid">-</span></span>
+</header>
+<main>
+<section>
+  <h2>设备遥测快照</h2>
+  <div class="meta" id="devices-meta">真实 0 · 模拟 0</div>
+  <table>
+    <thead><tr><th>SN</th><th>来源</th><th>类型</th><th>在线</th>
+      <th>电量</th><th>模式</th><th>位置</th><th>更新于</th></tr></thead>
+    <tbody id="devices-body"></tbody>
+  </table>
+</section>
+<section>
+  <h2>最近事件</h2>
+  <div class="filters">
+    <select id="ev-source">
+      <option value="">全部</option>
+      <option>zhiguang</option><option>skysys</option><option>siyun</option>
+      <option>flighthub</option><option>simulator</option>
+    </select>
+    <input id="ev-type" placeholder="event_type 过滤">
+    <select id="ev-limit">
+      <option>20</option><option selected>50</option><option>100</option>
+    </select>
+    <button id="ev-query">查询</button>
+  </div>
+  <table>
+    <thead><tr><th>时间</th><th>来源</th><th>类型</th><th>级别</th>
+      <th>event_id</th></tr></thead>
+    <tbody id="events-body"></tbody>
+  </table>
+</section>
+<section>
+  <h2>命令下发</h2>
+  <div class="tabs">
+    <button data-tab="xingluo" class="active">星逻 · 无人机</button>
+    <button data-tab="flycart">FlyCart · 司运</button>
+    <button data-tab="robot">清洁机器人 · 织光</button>
+  </div>
+  <form id="form-xingluo" data-path="/api/v1/commands/xingluo">
+    <label>command
+      <select name="command"><option>takeoff</option><option>pause</option>
+        <option>resume</option><option>return_home</option></select></label>
+    <label>site_id(takeoff 必填)<input name="site_id"></label>
+    <label>mission_id(takeoff 必填)<input name="mission_id"></label>
+    <label>uav_id(其余命令必填)<input name="uav_id"></label>
+    <label>camera_lens(可选透传)<input name="camera_lens"></label>
+    <label>idempotency_key
+      <span class="row"><input name="idempotency_key">
+        <button type="button" class="gen-key">生成</button></span></label>
+    <button class="submit" type="submit">下发星逻命令</button>
+  </form>
+  <form id="form-flycart" data-path="/api/v1/commands/flycart" hidden>
+    <label>device_sn *<input name="device_sn"></label>
+    <label>command
+      <select name="command"><option>create_task</option><option>start_task</option>
+        <option>edit_task_status</option><option>raw_cmd</option></select></label>
+    <label>task_id(start/edit 必填)<input name="task_id"></label>
+    <label>status(edit 必填)<input name="status"></label>
+    <label>idempotency_key
+      <span class="row"><input name="idempotency_key">
+        <button type="button" class="gen-key">生成</button></span></label>
+    <textarea name="task" placeholder='task JSON(create_task 必填),如 {"name":"运载A","waypoints":[]}'></textarea>
+    <textarea name="cmd" placeholder='cmd JSON(raw_cmd 必填),如 {"method":"open_door"}'></textarea>
+    <button class="submit" type="submit">下发 FlyCart 命令</button>
+  </form>
+  <form id="form-robot" data-path="/api/v1/commands/cleaning-robot" hidden>
+    <label>command
+      <select name="command"><option>forced_inbound</option>
+        <option>forced_outbound</option><option>temporary_cleaning</option></select></label>
+    <label>robot_id *<input name="robot_id"></label>
+    <label>status(入/出库)
+      <select name="status"><option value=""></option><option>open</option>
+        <option>close</option></select></label>
+    <label>scheduling_method
+      <select name="scheduling_method"><option value=""></option>
+        <option>asap</option><option>specifiedTime</option></select></label>
+    <label>scheduled_cleaning_at(YYYY-MM-DD HH:mm:ss)
+      <input name="scheduled_cleaning_at" placeholder="2026-07-20 14:30:00"></label>
+    <label>idempotency_key
+      <span class="row"><input name="idempotency_key">
+        <button type="button" class="gen-key">生成</button></span></label>
+    <button class="submit" type="submit">下发清洁机器人命令</button>
+  </form>
+  <div class="panel" id="cmd-panel" hidden>
+    <div class="summary" id="cmd-summary"></div>
+    <span class="pill" id="cmd-status"></span>
+    <pre id="cmd-result"></pre>
+  </div>
+</section>
+<section>
+  <h2>运行时</h2>
+  <div class="env-warn" id="env-warn" hidden></div>
+  <div class="kv" id="providers-kv"></div>
+  <div class="kv" id="stats-kv"></div>
+  <table>
+    <thead><tr><th>轮询任务</th><th>间隔</th><th>下次</th><th>成功</th>
+      <th>失败</th><th>最近错误</th></tr></thead>
+    <tbody id="jobs-body"></tbody>
+  </table>
+</section>
+<section>
+  <h2>Features</h2>
+  <table>
+    <thead><tr><th>id</th><th>说明</th><th>优先级</th><th>状态</th></tr></thead>
+    <tbody id="features-body"></tbody>
+  </table>
+</section>
+</main>
+<script>
+"use strict";
+function esc(value) {
+  return String(value == null ? "" : value)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+var lastRid = document.getElementById("last-rid");
+function fetchJson(path, options) {
+  return fetch(path, options).then(function (resp) {
+    lastRid.textContent = resp.headers.get("X-Request-Id") || "-";
+    return resp.json().then(function (doc) {
+      return { status: resp.status, doc: doc };
+    });
+  });
+}
+function refreshHealth() {
+  var dot = document.getElementById("health-dot");
+  var text = document.getElementById("health-text");
+  fetchJson("/healthz").then(function (result) {
+    if (result.status === 200) {
+      dot.className = "dot ok"; text.textContent = "服务存活";
+    } else {
+      dot.className = "dot bad"; text.textContent = "HTTP " + result.status;
+    }
+  }).catch(function () {
+    dot.className = "dot bad"; text.textContent = "不可达";
+  });
+}
+function fmtTime(value) {
+  if (!value) { return "-"; }
+  var stamp = new Date(value);
+  if (isNaN(stamp.getTime())) { return esc(value); }
+  return stamp.toLocaleTimeString("zh-CN", { hour12: false });
+}
+function refreshDevices() {
+  fetchJson("/api/v1/status/devices").then(function (result) {
+    var doc = result.doc;
+    document.getElementById("devices-meta").textContent =
+      "真实 " + doc.real_count + " · 模拟 " + doc.simulated_count;
+    var rows = (doc.devices || []).map(function (dev) {
+      var pct = dev.battery_percent == null ? null : Math.round(dev.battery_percent);
+      var barClass = pct != null && pct < 20 ? "bar low" : "bar";
+      var battery = pct == null ? "-" :
+        '<span class="' + barClass + '"><i style="width:' + pct + '%"></i></span> ' + pct + "%";
+      var pos = dev.longitude == null || dev.latitude == null ? "-" :
+        Number(dev.longitude).toFixed(3) + ", " + Number(dev.latitude).toFixed(3);
+      return "<tr><td>" + esc(dev.sn) + "</td>" +
+        '<td><span class="chip src-' + esc(dev.source) + '">' + esc(dev.source) + "</span></td>" +
+        "<td>" + esc(dev.device_kind) + "</td>" +
+        "<td>" + (dev.online ? "在线" : "离线") + "</td>" +
+        "<td>" + battery + "</td><td>" + esc(dev.mode_code) + "</td>" +
+        "<td>" + esc(pos) + "</td><td>" + fmtTime(dev.updated_at) + "</td></tr>";
+    });
+    document.getElementById("devices-body").innerHTML = rows.join("");
+  });
+}
+function refreshEvents() {
+  var source = document.getElementById("ev-source").value;
+  var evType = document.getElementById("ev-type").value.trim();
+  var limit = document.getElementById("ev-limit").value;
+  var query = "/api/v1/events/recent?limit=" + encodeURIComponent(limit);
+  if (source) { query += "&source=" + encodeURIComponent(source); }
+  if (evType) { query += "&event_type=" + encodeURIComponent(evType); }
+  fetchJson(query).then(function (result) {
+    var rows = (result.doc.events || []).map(function (ev) {
+      return '<tr class="sev-' + esc(ev.severity) + '"><td>' + fmtTime(ev.ts) +
+        '</td><td><span class="chip src-' + esc(ev.source) + '">' + esc(ev.source) +
+        "</span></td><td>" + esc(ev.event_type) + "</td><td>" + esc(ev.severity) +
+        "</td><td>" + esc(ev.event_id) + "</td></tr>";
+    });
+    document.getElementById("events-body").innerHTML = rows.join("");
+  });
+}
+function kvHtml(pairs) {
+  return pairs.map(function (pair) {
+    return "<b>" + esc(pair[0]) + "</b><span>" + esc(pair[1]) + "</span>";
+  }).join("");
+}
+function refreshRuntime() {
+  fetchJson("/api/v1/status/runtime").then(function (result) {
+    var doc = result.doc;
+    var warn = document.getElementById("env-warn");
+    if ((doc.env_warnings || []).length) {
+      warn.hidden = false;
+      warn.textContent = "环境变量疑似配置问题:" + doc.env_warnings.join(";");
+    } else { warn.hidden = true; }
+    var providerPairs = Object.keys(doc.providers || {}).map(function (name) {
+      return [name, doc.providers[name].configured ? "已接线" : "未配置(门控)"];
+    });
+    document.getElementById("providers-kv").innerHTML = kvHtml(providerPairs);
+    var statPairs = [];
+    Object.keys(doc.sink || {}).forEach(function (key) {
+      statPairs.push(["sink." + key, doc.sink[key]]);
+    });
+    Object.keys(doc.forwarder || {}).forEach(function (key) {
+      statPairs.push(["外发." + key, doc.forwarder[key]]);
+    });
+    Object.keys(doc.commands || {}).forEach(function (key) {
+      statPairs.push(["命令." + key, doc.commands[key]]);
+    });
+    document.getElementById("stats-kv").innerHTML = kvHtml(statPairs);
+    var jobs = (doc.poller_jobs || []).map(function (job) {
+      return "<tr><td>" + esc(job.name) + "</td><td>" + esc(job.interval_s) +
+        "s</td><td>" + esc(job.next_run_in_s) + "s</td><td>" + esc(job.success) +
+        "</td><td>" + esc(job.fail) + "</td><td>" +
+        esc(job.gated ? "未配置(门控)" : job.last_error) + "</td></tr>";
+    });
+    document.getElementById("jobs-body").innerHTML = jobs.join("");
+  });
+}
+function refreshFeatures() {
+  fetchJson("/api/v1/status/features").then(function (result) {
+    var rows = (result.doc.features || []).map(function (item) {
+      return "<tr><td>" + esc(item.id) + "</td><td>" + esc(item.title) +
+        "</td><td>" + esc(item.priority) + "</td><td>" + esc(item.status) +
+        "</td></tr>";
+    });
+    document.getElementById("features-body").innerHTML = rows.join("");
+  });
+}
+function refreshAll() {
+  refreshHealth(); refreshDevices(); refreshEvents();
+  refreshRuntime(); refreshFeatures();
+}
+document.getElementById("refresh-now").addEventListener("click", refreshAll);
+document.getElementById("ev-query").addEventListener("click", refreshEvents);
+var timer = null;
+function armTimer() {
+  if (timer) { clearInterval(timer); timer = null; }
+  if (document.getElementById("auto-refresh").checked) {
+    timer = setInterval(refreshAll,
+      Number(document.getElementById("refresh-interval").value));
+  }
+}
+document.getElementById("auto-refresh").addEventListener("change", armTimer);
+document.getElementById("refresh-interval").addEventListener("change", armTimer);
+document.querySelectorAll(".tabs button").forEach(function (btn) {
+  btn.addEventListener("click", function () {
+    document.querySelectorAll(".tabs button").forEach(function (other) {
+      other.classList.toggle("active", other === btn);
+    });
+    ["xingluo", "flycart", "robot"].forEach(function (tab) {
+      document.getElementById("form-" + tab).hidden = tab !== btn.dataset.tab;
+    });
+  });
+});
+document.querySelectorAll(".gen-key").forEach(function (btn) {
+  btn.addEventListener("click", function () {
+    var input = btn.parentElement.querySelector("input");
+    if (window.crypto && crypto.randomUUID) {
+      input.value = crypto.randomUUID();
+    } else {
+      input.value = "key-" + Date.now() + "-" +
+        Math.random().toString(16).slice(2, 10);
+    }
+  });
+});
+document.querySelectorAll("form[data-path]").forEach(function (form) {
+  form.addEventListener("submit", function (evt) {
+    evt.preventDefault();
+    var payload = {};
+    var bad = null;
+    Array.prototype.forEach.call(form.elements, function (el) {
+      if (!el.name || !el.value) { return; }
+      if (el.tagName === "TEXTAREA") {
+        try { payload[el.name] = JSON.parse(el.value); }
+        catch (err) { bad = el.name + " 不是合法 JSON"; }
+      } else { payload[el.name] = el.value; }
+    });
+    var panel = document.getElementById("cmd-panel");
+    var pill = document.getElementById("cmd-status");
+    panel.hidden = false;
+    if (bad) {
+      pill.className = "pill bad"; pill.textContent = "本地校验失败";
+      document.getElementById("cmd-result").textContent = bad;
+      return;
+    }
+    document.getElementById("cmd-summary").textContent =
+      "POST " + form.dataset.path + " · " + JSON.stringify(payload);
+    fetchJson(form.dataset.path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }).then(function (result) {
+      pill.className = result.status < 400 ? "pill ok" : "pill bad";
+      pill.textContent = "HTTP " + result.status;
+      document.getElementById("cmd-result").textContent =
+        JSON.stringify(result.doc, null, 2);
+    }).catch(function (err) {
+      pill.className = "pill bad"; pill.textContent = "请求失败";
+      document.getElementById("cmd-result").textContent = String(err);
+    });
+  });
+});
+refreshAll();
+armTimer();
+</script>
+</body>
+</html>

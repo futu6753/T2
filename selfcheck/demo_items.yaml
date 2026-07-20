@@ -1,0 +1,78 @@
+# =============================================================================
+# @file    demo_items.yaml
+# @brief   DEMO 简化清单 D1–D9 声明式 DSL(H05 §4 / 13-R-IDP-3)
+#          单一事实来源:selfcheck_prod 与 H09-B 回归用例由本文件生成成对断言,
+#          新增简化项即自动获得"DEMO 生效 / 生产失效"成对校验,杜绝清单与测试脱节。
+# @author  港电实验室平台组
+# @date    2026-07-18
+# Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+#
+# 字段说明:
+#   level: profile = 基于 SecurityProfile 快照断言(里程碑 1 即生效)
+#          http    = 基于 HTTP 端点断言(进程内 ASGI 客户端执行,里程碑 2 起强制)
+#   check: selfcheck/registry.py 中登记的检查函数 id
+#   demo_expect / prod_expect: 两种模式下的期望观测值
+#   (原 pending 字段已随里程碑 2 IdP 上线全部解除,GAP-02 关闭)
+# =============================================================================
+- id: D1
+  name: 种子演示账号
+  level: profile
+  check: seed_accounts_enabled
+  demo_expect: true
+  prod_expect: false
+
+- id: D2
+  name: 测试验证码
+  level: profile
+  check: test_code_123456_accepted
+  demo_expect: true
+  prod_expect: false
+
+- id: D3
+  name: 短信验证码回显
+  level: profile
+  check: sms_echo_enabled
+  demo_expect: true
+  prod_expect: false
+
+- id: D4
+  name: 证书测试入口
+  level: http
+  check: http_cert_demo_status
+  demo_expect: 200
+  prod_expect: 404
+
+- id: D5
+  name: 微信测试扫码
+  level: http
+  check: http_wechat_mock_status
+  demo_expect: 200
+  prod_expect: 404
+
+- id: D6
+  name: 明文 HTTP 与 Secure Cookie
+  level: profile
+  check: cookie_secure_required
+  demo_expect: false
+  prod_expect: true
+
+- id: D7
+  name: 口令策略简化
+  level: profile
+  check: enforce_password_age
+  demo_expect: false
+  prod_expect: true
+
+- id: D8
+  name: 限速简化
+  level: profile
+  check: rate_multiplier
+  demo_expect: 10
+  prod_expect: 1
+
+- id: D9
+  name: 演示横幅
+  level: profile
+  check: banner_text
+  demo_expect: "演示模式,仅限测试"
+  prod_expect: "生产模式"
