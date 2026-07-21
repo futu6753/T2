@@ -21,6 +21,7 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(REPO_ROOT, "packages"))
 sys.path.insert(0, REPO_ROOT)
 
+from gd_common.errors import PlatformError                      # noqa: E402
 from gd_crypto.keyring import MasterKeyRing                     # noqa: E402
 from gd_crypto.suites import current_suite                      # noqa: E402
 from gd_sso_client.client import load_config, SsoClient         # noqa: E402
@@ -43,6 +44,12 @@ def _http_transport(method: str, url: str, headers: dict, body):
             return resp.status, dict(resp.headers), resp.read()
     except urllib.error.HTTPError as exc:
         return exc.code, dict(exc.headers or {}), exc.read()
+    except (urllib.error.URLError, OSError) as exc:
+        # DNS 解析失败/证书校验失败/连接拒绝等一律转 PlatformError:
+        # RP 路由层捕获后回 503 + 明文原因,而非裸 500(06-E18)
+        reason = getattr(exc, "reason", None) or exc
+        raise PlatformError(
+            f"SSO 后端不可达 {url.split('?')[0]}: {reason}") from exc
 
 
 def _make_store():

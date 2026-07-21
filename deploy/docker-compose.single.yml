@@ -73,7 +73,11 @@ services:
       SSO_CLIENT_SECRET: ${CV_SSO_SECRET:?}
       SSO_REDIRECT: ${CV_REDIRECT:-https://cv.gangdian.internal/sso/callback}
       CV_BLOB_DIR: /data/blobs
-    volumes: ["cvblobs:/data/blobs"]
+      # 信任自签 CA(urllib 服务端校验 https://sso.* 证书链用;换正式 CA 后可移除)
+      SSL_CERT_FILE: /etc/gd/certs/gangdian-ca.crt
+    volumes:
+      - "cvblobs:/data/blobs"
+      - "./certs/gangdian-ca.crt:/etc/gd/certs/gangdian-ca.crt:ro"
 
   nvr:
     <<: *app
@@ -84,6 +88,8 @@ services:
       SSO_CLIENT_ID: nvr
       SSO_CLIENT_SECRET: ${NVR_SSO_SECRET:?}
       SSO_REDIRECT: ${NVR_REDIRECT:-https://nvr.gangdian.internal/sso/callback}
+      SSL_CERT_FILE: /etc/gd/certs/gangdian-ca.crt
+    volumes: ["./certs/gangdian-ca.crt:/etc/gd/certs/gangdian-ca.crt:ro"]
 
   factory3d:
     <<: *app
@@ -95,6 +101,8 @@ services:
       SSO_CLIENT_SECRET: ${F3D_SSO_SECRET:?}
       SSO_REDIRECT: ${F3D_REDIRECT:-https://f3d.gangdian.internal/sso/callback}
       F3D_ADMIN_TOKEN: ${F3D_ADMIN_TOKEN:-}
+      SSL_CERT_FILE: /etc/gd/certs/gangdian-ca.crt
+    volumes: ["./certs/gangdian-ca.crt:/etc/gd/certs/gangdian-ca.crt:ro"]
 
   quiz:
     <<: *app
@@ -105,6 +113,8 @@ services:
       SSO_CLIENT_ID: quiz
       SSO_CLIENT_SECRET: ${QUIZ_SSO_SECRET:?}
       SSO_REDIRECT: ${QUIZ_REDIRECT:-https://quiz.gangdian.internal/sso/callback}
+      SSL_CERT_FILE: /etc/gd/certs/gangdian-ca.crt
+    volumes: ["./certs/gangdian-ca.crt:/etc/gd/certs/gangdian-ca.crt:ro"]
 
   # ---- adapter:南向云云对接,独立入口,不走 IdP SSO ----
   adapter:
@@ -120,6 +130,17 @@ services:
       - "./certs:/etc/nginx/certs:ro"
     ports: ["443:443", "80:80"]
     depends_on: [idp, certvault, nvr, factory3d, quiz, adapter]
+    # 关键:容器内解析六个公网域名 → nginx(RP 服务端换令牌/取 JWKS 走这里;
+    # 缺此别名时容器内 DNS 解析失败,/sso/login 直接 500)
+    networks:
+      default:
+        aliases:
+          - sso.gangdian.internal
+          - cv.gangdian.internal
+          - nvr.gangdian.internal
+          - f3d.gangdian.internal
+          - quiz.gangdian.internal
+          - adapter.gangdian.internal
     restart: unless-stopped
 
 volumes:
