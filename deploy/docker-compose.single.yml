@@ -56,6 +56,10 @@ services:
       MASTER_KEY_ID: ${MASTER_KEY_ID:-mk1}
       CRYPTO_SUITE: ${CRYPTO_SUITE:-intl}
       IDP_KEY_DIR: /data/keys
+      # IdP 对外 issuer(发现文档端点与 id_token 的 iss 都由它生成;
+      # 缺省时代码回退 http://127.0.0.1:9000,浏览器会被 302 到本机地址)
+      # 仅 idp 读取,其余服务忽略。
+      IDP_ISSUER: ${SSO_ISSUER:-https://sso.gangdian.internal}
     volumes: ["idpkeys:/data/keys"]
     depends_on:
       postgres: {condition: service_healthy}
