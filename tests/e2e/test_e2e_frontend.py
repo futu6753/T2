@@ -59,8 +59,9 @@ class TestBrowserFrontend(unittest.TestCase):
         """profile 未注入 → 生产指示条;healthz 无 demo 时绝无红色横幅"""
         page = self._page()
         page.goto(f"{self.stack.rp_base}/app")
-        page.wait_for_selector(".gd-banner-prod, .gd-banner-demo")
-        self.assertTrue(page.locator(".gd-banner-prod").count() == 1)
+        # 直接等待生产指示条(count() 不自动等待,health 到达瞬间的
+        # 重渲会被瞬时采样踩空——全量跑批高负载下实测偶发,2026-07-21 加固)
+        page.wait_for_selector(".gd-banner-prod")
         self.assertEqual(page.locator(".gd-banner-demo").count(), 0)
         # 成对反向:直接驱动组件态(前端二态互斥由同一 health.mode 驱动)
         mode = page.evaluate(
