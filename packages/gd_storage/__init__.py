@@ -7,7 +7,7 @@
 Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
 """
 from gd_storage.audit import AuditWriter, verify_chain
-from gd_storage.database import Database
+from gd_storage.database import DB_ERRORS, Database
 from gd_storage.migrations import apply_migrations
 from gd_storage.volatile import (
     IVolatileStore,
@@ -17,4 +17,4 @@ from gd_storage.volatile import (
 )
 
 __all__ = ["Database", "apply_migrations", "AuditWriter", "verify_chain",
-           "IVolatileStore", "LocalVolatileStore", "RedisVolatileStore", "make_key"]
+           "DB_ERRORS", "IVolatileStore", "LocalVolatileStore", "RedisVolatileStore", "make_key"]

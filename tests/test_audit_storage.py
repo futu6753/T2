@@ -55,9 +55,10 @@ class TestAuditChain(unittest.TestCase):
     def test_a4_audit_update_delete_rejected(self):
         """触发器拒绝 UPDATE/DELETE(只增不改,H09 A.4 / J.2)"""
         self._append_samples()
-        with self.assertRaises(sqlite3.DatabaseError):
+        from gd_storage import DB_ERRORS         # 双方言异常(J.1/J.2)
+        with self.assertRaises(DB_ERRORS):
             self.db.execute("UPDATE audit_logs SET actor = 'evil' WHERE id = 1")
-        with self.assertRaises(sqlite3.DatabaseError):
+        with self.assertRaises(DB_ERRORS):
             self.db.execute("DELETE FROM audit_logs WHERE id = 1")
 
     def test_a4_audit_tamper_detected(self):

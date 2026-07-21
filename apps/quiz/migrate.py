@@ -82,8 +82,10 @@ def _merge(db, guest_owner: str, sso_owner: str) -> dict:
             " wrong_count, in_wrongbook, last_result, updated_at)"
             " VALUES(?,?,?,?,?,?,?)"
             " ON CONFLICT(owner, question_id) DO UPDATE SET"
-            " correct_count = correct_count + ?, wrong_count = wrong_count + ?,"
-            " in_wrongbook = MAX(in_wrongbook, ?), updated_at = ?",
+            " correct_count = quiz_progress.correct_count + ?,"
+            " wrong_count = quiz_progress.wrong_count + ?,"
+            " in_wrongbook = CASE WHEN ? = 1 THEN 1"
+            "  ELSE quiz_progress.in_wrongbook END, updated_at = ?",
             (sso_owner, row[0], row[1], row[2], row[3], row[4], row[5],
              row[1], row[2], row[3], row[5]))
         moved["progress"] += 1

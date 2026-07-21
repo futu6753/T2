@@ -70,8 +70,9 @@
   备份 cron/统一 RP 入口)与八份运维文档;浏览器全链路验证(Playwright
   真服务:gm SSO 链 SM2SM3 真签验闭环 + certvault SPA 登录/上传/发证/
   溯源四步链)抓出并修复三条真缺陷(SPA 类型契约归一化、multipart
-  空字段解析、四 SPA 导航 Provider 外失效)。262 项回归 + CI 六步
-  门禁全绿(eslint/prettier 真跑)。
+  空字段解析、四 SPA 导航 Provider 外失效);双库同测真实落地
+  (GAP-03/04 解除:PostgreSQL 16 + Redis 7 真集成,36 模块 PG 方言
+  全绿,修复四类方言缺口)。266 项回归 + CI 六步门禁全绿。
 - 完工审计(2026-07-19)✅:路由树递归盘点对照 L02/L04 清单,certvault
   零缺口;nvr 补齐设置区 C3 全语义/渠道就绪度/日志 UNION 区/cron 解析器/
   两 CLI 工件;深度回归 17 项新增(缩放溯源/多备案/二压/去抖三模式端到端/

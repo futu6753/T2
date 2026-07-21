@@ -6,8 +6,8 @@
 |---|---|---|---|---|
 | GAP-01 | 国密套件 gm 为占位实现,调用抛明确错误,禁止静默降级 | `gd_crypto/suites.py` GmSuiteStub;`gd_sso_client/jwt_verify.py` SM2 验签 | 目标环境接入国密 Provider 后替换,并跑 H09-F gm 冒烟 | **已解除(里程碑 10)**:`gd_crypto/gm/` 纯 Python 参考实现(SM3/SM4-GCM/SM2,标准向量+AES-GCM 对拍锚定);F 组 11 用例全绿(冒烟/切换/迁移/DEMO 正交/profile)。生产提档路径:接入硬件或合规 Provider 时仅需替换 `GmSuite` 内核函数,接口与信封格式不变;PBKDF2 迭代数同步提档(见 suites.py 注释) |
 | GAP-02 | 自检 DSL 中 D4/D5 为 http 级断言,待 IdP 端点落地后转强制 | `selfcheck/demo_items.yaml` | 里程碑 2 IdP 上线,注册 http 检查函数并删除 pending 字段 | **已解除(里程碑 2)**:`selfcheck/registry.py` HTTP_CHECKS + 进程内 ASGI 执行;回归 `test_r_idp3_http_assertions_demo_and_prod` |
-| GAP-03 | PostgreSQL 全量测试未在本环境执行(无 PG 服务) | `ci_gate.sh` 提供 GD_TEST_PG_URL 一键入口 | 目标环境设 GD_TEST_PG_URL 后跑双库同测(H09-J.1) | 未解除 |
-| GAP-04 | Redis 集成测试未在本环境执行(无 Redis 服务);fail-closed 语义已有 mock 级活体测试 | `tests/test_audit_storage.py` | 目标环境起 Redis 后跑跨实例累加/宕机 fail-closed(H09-J.4) | 未解除 |
+| GAP-03 | PostgreSQL 全量测试未在本环境执行(无 PG 服务) | `ci_gate.sh` 提供 GD_TEST_PG_URL 一键入口 | 目标环境设 GD_TEST_PG_URL 后跑双库同测(H09-J.1) | **已解除(里程碑 10 收官)**:构建机装 PostgreSQL 16(UTF-8),`tests/base.make_db_url` 接线 GD_DB_URL(每环境独立库 + atexit 回收);全部 36 测试模块含浏览器组在 PG 方言下全绿;抓出并修复方言缺口四类(INSERT OR IGNORE→ON CONFLICT、UPSERT 裸列名歧义、标量 MAX(a,b)、单方言异常断言/DROP TRIGGER)。目标环境上线前仍按本入口复验一次 |
+| GAP-04 | Redis 集成测试未在本环境执行(无 Redis 服务);fail-closed 语义已有 mock 级活体测试 | `tests/test_audit_storage.py` | 目标环境起 Redis 后跑跨实例累加/宕机 fail-closed(H09-J.4) | **已解除(里程碑 10 收官)**:构建机装 Redis 7,`tests/test_j_pg_redis.py` J.4 两用例——双 IdP 实例共享真 Redis 锁定计数跨实例累加/解锁互见、死端口 fail-closed 明示不可用(GD_TEST_REDIS_URL 驱动,目标环境同入口复验) |
 | GAP-05 | ISsoClient 为接口定义,空实现 | `gd_sso_client/__init__.py` | 里程碑 2 交付实现 + 继承 nvr test_sso 8 用例语义(H06-E13) | **已解除(里程碑 2)**:`gd_sso_client/client.py`;回归 `tests/test_c_sso_client.py`(7 用例) |
 | GAP-06 | 审计留存清理(整段归档导出→删除最旧段→重锚)未实现 | 里程碑排期 | 实现后补跨档校验测试(H09-J.2) | 未解除(移交里程碑 8 运维线) |
 | GAP-07 | DEMO 态每小时审计心跳依赖应用生命周期调度器 | `scripts/run_idp.py` | 实现后补存活性测试(H07 L1-12) | **部分解除(里程碑 2)**:心跳任务已挂 `run_idp.py` 事件循环;存活性测试待里程碑 8 部署联测补 |

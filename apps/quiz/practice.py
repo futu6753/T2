@@ -94,9 +94,10 @@ class PracticeService:
             " wrong_count, in_wrongbook, last_result, updated_at)"
             " VALUES(?,?,?,?,?,?,?)"
             " ON CONFLICT(owner, question_id) DO UPDATE SET"
-            " correct_count = correct_count + ?,"
-            " wrong_count = wrong_count + ?,"
-            " in_wrongbook = CASE WHEN ? = 1 THEN 1 ELSE in_wrongbook END,"
+            " correct_count = quiz_progress.correct_count + ?,"
+            " wrong_count = quiz_progress.wrong_count + ?,"
+            " in_wrongbook = CASE WHEN ? = 1 THEN 1"
+            "  ELSE quiz_progress.in_wrongbook END,"
             " last_result = ?, updated_at = ?",
             (owner, question["id"], 1 if correct else 0, 0 if correct else 1,
              0 if correct else 1, result, _now_iso(),

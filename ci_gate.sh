@@ -10,7 +10,7 @@ echo "[1/6] 全量回归测试(SQLite)"
 python3 -m unittest discover -s tests
 
 if [ -n "${GD_TEST_PG_URL:-}" ]; then
-  echo "[1b] 双库同测(PostgreSQL)  # GAP-03 一键入口"
+  echo "[1b] 双库同测(PostgreSQL)  # GAP-03 入口;同时设 GD_TEST_REDIS_URL 可连带跑 J.4 Redis 集成(GAP-04)"
   GD_DB_URL="${GD_TEST_PG_URL}" python3 -m unittest discover -s tests
 fi
 

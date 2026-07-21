@@ -238,7 +238,12 @@ class TestAuditChainInterleaved(unittest.TestCase):
                     " WHERE id = (SELECT MAX(id) - 3 FROM audit_logs)")
             # 保护层二:模拟攻击者离线拿到 DB(先卸触发器再篡改)
             # → 链式哈希校验必失败(不可抵赖兜底)
-            env.db.execute("DROP TRIGGER IF EXISTS trg_audit_no_update")
+            from gd_storage.database import DIALECT_POSTGRES
+            if env.db.dialect == DIALECT_POSTGRES:   # 双方言卸载(J.1)
+                env.db.execute(
+                    "DROP TRIGGER IF EXISTS trg_audit_no_update ON audit_logs")
+            else:
+                env.db.execute("DROP TRIGGER IF EXISTS trg_audit_no_update")
             env.db.execute(
                 "UPDATE audit_logs SET detail = '{\"forged\":1}'"
                 " WHERE id = (SELECT MAX(id) - 3 FROM audit_logs)")

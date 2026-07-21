@@ -55,7 +55,8 @@ class AbilityService:
                                         question["difficulty"], correct)
         self._db.execute(
             "INSERT INTO quiz_ability(owner, rating, games) VALUES(?,?,1)"
-            " ON CONFLICT(owner) DO UPDATE SET rating = ?, games = games + 1",
+            " ON CONFLICT(owner) DO UPDATE SET rating = ?,"
+            " games = quiz_ability.games + 1",
             (owner, new_user, new_user))
         self._db.execute(
             "UPDATE quiz_questions SET difficulty = ? WHERE id = ?",

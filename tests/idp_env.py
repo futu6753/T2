@@ -9,7 +9,7 @@ Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
 """
 import tempfile
 
-from tests.base import TEST_KEY_HEX
+from tests.base import make_db_url, TEST_KEY_HEX
 
 from gd_storage import LocalVolatileStore
 from apps.idp.context import IdpContext
@@ -26,11 +26,13 @@ TEST_IP = "10.0.0.1"
 class IdpEnv:
     """一套可重启的 IdP 测试环境(db/keys/store 跨"重启"保持)。"""
 
-    def __init__(self, is_demo: bool = False, extra_environ: dict = None):
-        """@brief 首次构建环境 @param extra_environ 追加环境(如 CRYPTO_SUITE=gm)"""
-        self.db_path = tempfile.mktemp(suffix=".db")
+    def __init__(self, is_demo: bool = False, extra_environ: dict = None,
+                 store=None):
+        """@brief 首次构建环境 @param extra_environ 追加环境(如 CRYPTO_SUITE=gm)
+        @param store 易失态注入(J.4 Redis 集成用;缺省本地单机)"""
+        self.db_url = make_db_url()          # GD_DB_URL 有则 PG 独立库(J.1)
         self.key_dir = tempfile.mkdtemp(prefix="idp-keys-")
-        self.store = LocalVolatileStore()
+        self.store = LocalVolatileStore() if store is None else store
         self.is_demo = is_demo
         self.extra_environ = dict(extra_environ or {})
         self.ctx = None
@@ -48,7 +50,7 @@ class IdpEnv:
         """@brief 重建应用(模拟进程重启:store/db/keys 持久,进程对象全新)"""
         if self.ctx is not None:
             self.ctx.close()
-        self.ctx = IdpContext(f"sqlite:///{self.db_path}", self.key_dir,
+        self.ctx = IdpContext(self.db_url, self.key_dir,
                               store=self.store, environ=self._environ())
         self.app = create_app(self.ctx)
         return self

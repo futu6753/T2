@@ -473,3 +473,18 @@ nvr 发现 6 条路由缺口与 3 个工件缺口,全部补齐。
   未安装)——eslint + prettier 本次起在 CI 第 6 步真跑并通过。
 - 测试基建:`tests/e2e/live.py` LiveIdpEnv/LiveStack 支持
   `idp_extra_environ`(注入 CRYPTO_SUITE=gm 等)。
+
+### 双库同测与真实中间件集成(2026-07-21,GAP-03/GAP-04 解除)
+- 排雷:`ci_gate.sh` 的 GD_DB_URL 此前无消费点("入口提供但未接线")。
+  接线:`tests/base.make_db_url`(GD_DB_URL 有则每测试环境创建独立 PG 库,
+  atexit 统一 `DROP ... WITH (FORCE)` 回收——库堆积曾实测撑爆构建机磁盘);
+  `IdpEnv` 增 db_url 与 store 注入参数。
+- 新增 `tests/test_j_pg_redis.py`:J.1 PG 迁移幂等/审计禁改触发器/
+  R-IDP-2 套件迁移端到端;J.4 真 Redis 跨实例锁定累加 + 宕机 fail-closed。
+- 全部 36 测试模块(含 Playwright 浏览器组)在 PostgreSQL 16 方言下全绿;
+  修复方言缺口四类:① `INSERT OR IGNORE` → `_adapt_sql` 通用改写
+  `ON CONFLICT DO NOTHING`(业务零改动);② UPSERT DO UPDATE 裸列名
+  在 PG 歧义 → 表名限定(quiz practice/elo/migrate 三处);③ SQLite
+  标量 `MAX(a,b)` PG 不存在 → CASE 等价改写;④ 单方言断言/裸
+  DROP TRIGGER → `gd_storage.DB_ERRORS` 双方言异常元组与按 dialect 分支。
+- SQLite 默认路径 266 项全量防回归全绿(J 组 4 项在未设环境时跳过)。

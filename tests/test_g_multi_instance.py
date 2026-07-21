@@ -37,7 +37,7 @@ class MultiInstanceEnv:
         """@brief 实例 1 由 IdpEnv 提供;实例 2 手工装配同源上下文"""
         self.env = IdpEnv(is_demo=False)
         self.env.seed_admin_and_user()
-        self.ctx2 = IdpContext(f"sqlite:///{self.env.db_path}", self.env.key_dir,
+        self.ctx2 = IdpContext(self.env.db_url, self.env.key_dir,
                                store=self.env.store,
                                environ=self.env._environ())
         self.app2 = create_app(self.ctx2)

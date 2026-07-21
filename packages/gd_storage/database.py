@@ -13,6 +13,12 @@ import threading
 
 from gd_common.errors import ConfigError
 
+try:                                     # PG 驱动为可选依赖(单机形态无需)
+    import psycopg as _psycopg
+    DB_ERRORS = (sqlite3.DatabaseError, _psycopg.Error)
+except ImportError:                      # noqa: SIM105
+    DB_ERRORS = (sqlite3.DatabaseError,)
+
 DIALECT_SQLITE = "sqlite"
 DIALECT_POSTGRES = "postgres"
 SQLITE_URL_PREFIX = "sqlite:///"
@@ -55,6 +61,11 @@ class Database:
         if self.dialect == DIALECT_POSTGRES:
             sql = sql.replace("%", "%%")
             sql = sql.replace("?", "%s")
+            # SQLite 幂等插入方言 → PG 等价语义(J.1 双库同测发现,2026-07-21)
+            if sql.lstrip().upper().startswith("INSERT OR IGNORE "):
+                head = sql.lstrip()
+                sql = "INSERT " + head[len("INSERT OR IGNORE "):]
+                sql += " ON CONFLICT DO NOTHING"
         return sql
 
     def execute(self, sql: str, params: tuple = ()) -> None:
