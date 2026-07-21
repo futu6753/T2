@@ -1,0 +1,33 @@
+# 港电实验室统一平台运行依赖
+# 说明:deploy/fetch_libs.sh 预下载的 wheels/ 为补充包;numpy/opencv/scipy/
+# Pillow 等重型科学包体积大,离线部署建议随基础镜像或完整 wheels 镜像预置。
+# 安装:pip install -r requirements.txt
+# 离线:pip install --no-index --find-links wheels -r requirements.txt
+# Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+
+# ---- Web 框架与服务 ----
+fastapi
+uvicorn[standard]
+python-dotenv
+
+# ---- 密码学与口令 ----
+cryptography
+argon2-cffi
+fido2
+
+# ---- 图像与水印(certvault:盲水印/缩略图;quiz:配图)----
+numpy
+opencv-python-headless
+scipy               # 频域变换(dctn)
+Pillow
+reedsolo            # RS 纠错(96bit 暗码)
+
+# ---- 数据与配置 ----
+pyyaml
+redis               # 生产易失态(单机开发可不装,自动回退本地实现)
+
+# ---- 可选:PostgreSQL 生产库(SQLite 单机形态无需)----
+# psycopg[binary]
+
+# ---- 可选:浏览器 E2E(离线目标环境自动跳过,GAP-15)----
+# playwright        # 另需:playwright install chromium
