@@ -1,0 +1,16 @@
+# 构建上下文瘦身:排除版本控制、缓存、前端源码与依赖、测试与文档产物
+.git
+**/__pycache__
+**/*.pyc
+**/node_modules
+frontend/*/node_modules
+frontend/*/src
+frontend/*/*.ts
+frontend/*/*.json
+tests
+dist
+docs
+benchmarks/data
+.env
+*.md
+# 保留:apps/*/web/dist 与 apps/*/web/vendor(运行所需前端产物,在 apps/ 下不受本规则影响)

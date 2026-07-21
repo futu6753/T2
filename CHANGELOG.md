@@ -503,3 +503,25 @@ nvr 发现 6 条路由缺口与 3 个工件缺口,全部补齐。
   构建失败)——按 wheels 名单与 import 面生成,运行必备/可选(PG、
   Playwright)分层注明。
 - 打交付标签 v2.0.0-m10(附注:10/10 里程碑 + 双库同测 + 浏览器全链路)。
+
+### 单机六系统部署包(2026-07-21,针对国内网络在线构建)
+- 新增 `deploy/docker-compose.single.yml`:六系统单实例 + PG16(UTF-8 locale
+  固定)+ Redis + nginx 统一反代;镜像用阿里云公开源,健康检查 + 依赖顺序
+  编排;共享构建一镜像多入口。
+- 新增 `deploy/nginx.single.conf`:六域名反代,80→443 强制跳转,登录/API
+  限速,f3d WS 升级头透传,certvault 20m 上传上限。
+- 新增 `deploy/gen_selfsigned_certs.sh`:内网自签 CA + 六域名 SAN 证书
+  (leaf 825 天),实跑验证 SAN 齐全且 CA 校验通过。
+- 新增 `deploy/bootstrap.sh`:一键部署引导,两阶段解决"RP 依赖 IdP 先登记
+  SSO 客户端"的顺序问题(起 IdP → 容器内登记四 RP → 回填 .env → 起全量 →
+  冒烟),幂等。
+- 新增 `scripts/register_sso_clients.py`:四 RP 客户端一键幂等登记,输出可
+  回填的 .env 密钥行(已存在则跳过不重置);实跑验证登记与幂等重跑。
+- Dockerfile 国内源化:pip 走阿里云 PyPI(可 build-arg 覆盖),apt 换源并
+  补 opencv 运行所需系统库(libgl1/libglib2.0-0);瘦身只拷运行目录;
+  新增 `.dockerignore`。fetch_libs 默认源改 npmmirror。
+- env.example 扩为单机六系统全变量(四 RP 的 secret/redirect + issuer)。
+- 新增 `docs/deployment_single_host.md`:国内网络单机部署手册(镜像加速/
+  自签证书/DNS/换域名/排障/运维)。
+- 实证:模拟镜像内环境用 requirements 依赖真起 run_idp 与 run_rp certvault,
+  healthz 均 200,自检全绿,无 SSO 变量时优雅降级 sso_enabled=false。

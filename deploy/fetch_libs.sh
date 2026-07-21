@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 
 THREE_VERSION="0.160.1"
 VENDOR_DIR="apps/factory3d/web/vendor"
-REGISTRY="${NPM_REGISTRY:-https://registry.npmjs.org}"
+REGISTRY="${NPM_REGISTRY:-https://registry.npmmirror.com}"  # 默认国内源(npmmirror);出海环境可覆盖
 
 mkdir -p "${VENDOR_DIR}"
 TMP="$(mktemp -d)"

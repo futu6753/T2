@@ -1,0 +1,129 @@
+# =============================================================================
+# 港电统一平台 · 单机六系统部署(里程碑 10 部署包)
+# 目标:单台服务器跑全部六系统单实例(idp/certvault/nvr/factory3d/quiz/adapter)
+#       + PostgreSQL + Redis + nginx 统一反代。无 sticky、无冗余。
+# 镜像:使用国内可达源(见各 image 注释);首次 `docker compose build` 在线构建。
+# 用法:
+#   cp deploy/env.example .env && 按注释填写(chmod 600 .env)
+#   bash deploy/gen_selfsigned_certs.sh          # 生成自签证书到 deploy/certs/
+#   docker compose -f deploy/docker-compose.single.yml up -d --build
+#   python3 scripts/create_admin.py --account op_admin   # 或在 idp 容器内执行
+# Copyright (c) 2026 厦门自贸片区港务电力有限公司(港电实验室)
+# =============================================================================
+name: gangdian
+
+services:
+  postgres:
+    # 国内镜像:阿里云容器镜像服务公开加速(或改用你的内网 registry)
+    image: registry.cn-hangzhou.aliyuncs.com/library/postgres:16
+    environment:
+      POSTGRES_DB: gangdian
+      POSTGRES_USER: gd
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?必须显式提供(见 .env)}
+      # 中文数据依赖 UTF-8;initdb 参数固定 locale,避免 SQL_ASCII 踩坑
+      LANG: C.UTF-8
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gd -d gangdian"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: registry.cn-hangzhou.aliyuncs.com/library/redis:7
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes: ["redisdata:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # ---- 共享构建:六系统同一镜像,command 区分入口 ----
+  idp: &app
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: gangdian-platform:m10
+    command: python3 scripts/run_idp.py --host 0.0.0.0 --port 9000
+    environment: &base_env
+      DATABASE_URL: postgresql://gd:${PG_PASSWORD}@postgres/gangdian
+      REDIS_URL: redis://redis:6379/0
+      MASTER_KEY_HEX: ${MASTER_KEY_HEX:?生产必须注入(gen_master_key.py 生成)}
+      MASTER_KEY_ID: ${MASTER_KEY_ID:-mk1}
+      CRYPTO_SUITE: ${CRYPTO_SUITE:-intl}
+      IDP_KEY_DIR: /data/keys
+    volumes: ["idpkeys:/data/keys"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    restart: unless-stopped
+
+  # ---- 四个走 SSO 的 RP(经 run_rp.py 统一入口)----
+  certvault:
+    <<: *app
+    command: python3 scripts/run_rp.py certvault --host 0.0.0.0 --port 9100
+    environment:
+      <<: *base_env
+      SSO_ISSUER: ${SSO_ISSUER:-https://sso.gangdian.internal}
+      SSO_CLIENT_ID: certvault
+      SSO_CLIENT_SECRET: ${CV_SSO_SECRET:?}
+      SSO_REDIRECT: ${CV_REDIRECT:-https://cv.gangdian.internal/sso/callback}
+      CV_BLOB_DIR: /data/blobs
+    volumes: ["cvblobs:/data/blobs"]
+
+  nvr:
+    <<: *app
+    command: python3 scripts/run_rp.py nvr --host 0.0.0.0 --port 9200
+    environment:
+      <<: *base_env
+      SSO_ISSUER: ${SSO_ISSUER:-https://sso.gangdian.internal}
+      SSO_CLIENT_ID: nvr
+      SSO_CLIENT_SECRET: ${NVR_SSO_SECRET:?}
+      SSO_REDIRECT: ${NVR_REDIRECT:-https://nvr.gangdian.internal/sso/callback}
+
+  factory3d:
+    <<: *app
+    command: python3 scripts/run_rp.py factory3d --host 0.0.0.0 --port 9300
+    environment:
+      <<: *base_env
+      SSO_ISSUER: ${SSO_ISSUER:-https://sso.gangdian.internal}
+      SSO_CLIENT_ID: factory3d
+      SSO_CLIENT_SECRET: ${F3D_SSO_SECRET:?}
+      SSO_REDIRECT: ${F3D_REDIRECT:-https://f3d.gangdian.internal/sso/callback}
+      F3D_ADMIN_TOKEN: ${F3D_ADMIN_TOKEN:-}
+
+  quiz:
+    <<: *app
+    command: python3 scripts/run_rp.py quiz --host 0.0.0.0 --port 9400
+    environment:
+      <<: *base_env
+      SSO_ISSUER: ${SSO_ISSUER:-https://sso.gangdian.internal}
+      SSO_CLIENT_ID: quiz
+      SSO_CLIENT_SECRET: ${QUIZ_SSO_SECRET:?}
+      SSO_REDIRECT: ${QUIZ_REDIRECT:-https://quiz.gangdian.internal/sso/callback}
+
+  # ---- adapter:南向云云对接,独立入口,不走 IdP SSO ----
+  adapter:
+    <<: *app
+    command: python3 scripts/run_adapter.py --host 0.0.0.0 --port 8000
+    environment:
+      <<: *base_env
+
+  nginx:
+    image: registry.cn-hangzhou.aliyuncs.com/library/nginx:1.25
+    volumes:
+      - "./nginx.single.conf:/etc/nginx/nginx.conf:ro"
+      - "./certs:/etc/nginx/certs:ro"
+    ports: ["443:443", "80:80"]
+    depends_on: [idp, certvault, nvr, factory3d, quiz, adapter]
+    restart: unless-stopped
+
+volumes:
+  pgdata: {}
+  redisdata: {}
+  idpkeys: {}
+  cvblobs: {}
